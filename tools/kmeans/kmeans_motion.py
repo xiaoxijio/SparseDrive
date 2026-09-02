@@ -89,7 +89,7 @@ for i in range(len(CLASSES)):
     intention_cls = np.concatenate(intention[i], axis=0).reshape(-1, 24)
     if intention_cls.shape[0] < K:
         continue
-    cluster = KMeans(n_clusters=K).fit(intention_cls).cluster_centers_
+    cluster = KMeans(n_clusters=K, n_init=10).fit(intention_cls).cluster_centers_
     cluster = cluster.reshape(-1, 12, 2)
     clusters.append(cluster)
     for j in range(K):

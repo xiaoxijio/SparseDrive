@@ -26,7 +26,7 @@ for idx in tqdm(range(len(data_infos))):
     center.append(boxes[distance < DIS_THRESH])
 center = np.concatenate(center, axis=0)
 print("start clustering, may take a few minutes.")
-cluster = KMeans(n_clusters=K).fit(center).cluster_centers_
+cluster = KMeans(n_clusters=K, n_init=10).fit(center).cluster_centers_
 plt.scatter(cluster[:,0], cluster[:,1])
 plt.savefig(f'vis/kmeans/det_anchor_{K}', bbox_inches='tight')
 others = np.array([1,1,1,1,0,0,0,0])[np.newaxis].repeat(K, axis=0)

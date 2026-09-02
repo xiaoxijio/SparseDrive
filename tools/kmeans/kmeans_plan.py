@@ -27,7 +27,7 @@ for idx in tqdm(range(len(data_infos))):
 clusters = []
 for trajs in navi_trajs:
     trajs = np.concatenate(trajs, axis=0).reshape(-1, 12)
-    cluster = KMeans(n_clusters=K).fit(trajs).cluster_centers_
+    cluster = KMeans(n_clusters=K, n_init=10).fit(trajs).cluster_centers_
     cluster = cluster.reshape(-1, 6, 2)
     clusters.append(cluster)
     for j in range(K):

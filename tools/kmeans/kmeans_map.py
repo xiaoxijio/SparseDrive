@@ -20,7 +20,7 @@ for idx in tqdm(range(len(data_infos))):
         for geom in geoms:  
             center.append(geom.mean(axis=0))
 center = np.stack(center, axis=0)
-center = KMeans(n_clusters=K).fit(center).cluster_centers_
+center = KMeans(n_clusters=K, n_init=10).fit(center).cluster_centers_
 delta_y = np.linspace(-4, 4, num_sample)
 delta_x = np.zeros([num_sample])
 delta = np.stack([delta_x, delta_y], axis=-1)
