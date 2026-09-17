@@ -84,8 +84,8 @@ class InstanceBank(nn.Module):
     def get(self, batch_size, metas=None, dn_metas=None):
         instance_feature = torch.tile(
             self.instance_feature[None], (batch_size, 1, 1)
-        )
-        anchor = torch.tile(self.anchor[None], (batch_size, 1, 1))
+        )   # [bs, 900, 256]
+        anchor = torch.tile(self.anchor[None], (batch_size, 1, 1))  # [bs, 900, 11]
 
         if (
             self.cached_anchor is not None
@@ -232,7 +232,7 @@ class InstanceBank(nn.Module):
 
         mask = instance_id < 0
         if threshold is not None:
-            mask = mask & (confidence >= threshold)
+            mask = mask & (confidence >= threshold) # 给没有 ID 且分数达标的候选分配新 ID
         num_new_instance = mask.sum()
         new_ids = torch.arange(num_new_instance).to(instance_id) + self.prev_id
         instance_id[torch.where(mask)] = new_ids

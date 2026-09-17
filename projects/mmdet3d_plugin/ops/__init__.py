@@ -70,7 +70,7 @@ def feature_maps_format(feature_maps, inverse=False):
             torch.reshape(feat, (bs, num_cams, feat.shape[2], -1))
         )
 
-    col_feats = torch.cat(col_feats, dim=-1).permute(0, 1, 3, 2).flatten(1, 2)
+    col_feats = torch.cat(col_feats, dim=-1).permute(0, 1, 3, 2).flatten(1, 2)  # [1, 89760, 256]
     spatial_shape = [spatial_shape] * num_cams
     spatial_shape = torch.tensor(
         spatial_shape,

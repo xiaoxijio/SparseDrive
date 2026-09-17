@@ -181,8 +181,8 @@ class Sparse4DHead(BaseModule):
         ):
             self.sampler.dn_metas = None
         (
-            instance_feature,
-            anchor,
+            instance_feature,       # [bs, 900, 256] 当前候选的目标特征
+            anchor,                 # [bs, 900, 11]  当前候选的 3D 框及速度
             temp_instance_feature,
             temp_anchor,
             time_interval,
@@ -249,7 +249,7 @@ class Sparse4DHead(BaseModule):
             attn_mask[:num_free_instance, :num_free_instance] = False
             attn_mask[num_free_instance:, num_free_instance:] = dn_attn_mask
 
-        anchor_embed = self.anchor_encoder(anchor)
+        anchor_embed = self.anchor_encoder(anchor)  # [bs, 900, 256]  对 anchor 几何状态进行编码后的特征
         if temp_anchor is not None:
             temp_anchor_embed = self.anchor_encoder(temp_anchor)
         else:
@@ -262,19 +262,19 @@ class Sparse4DHead(BaseModule):
         for i, op in enumerate(self.operation_order):
             if self.layers[i] is None:
                 continue
-            elif op == "temp_gnn":
+            elif op == "temp_gnn":  # 当前候选读取历史实例的信息 cross-attention
                 instance_feature = self.graph_model(
                     i,
-                    instance_feature,
-                    temp_instance_feature,
-                    temp_instance_feature,
+                    instance_feature,           # Query
+                    temp_instance_feature,      # Key
+                    temp_instance_feature,      # Value
                     query_pos=anchor_embed,
                     key_pos=temp_anchor_embed,
                     attn_mask=attn_mask
                     if temp_instance_feature is None
                     else None,
                 )
-            elif op == "gnn":
+            elif op == "gnn":   # 当前候选之间交换信息 self-attention
                 instance_feature = self.graph_model(
                     i,
                     instance_feature,
@@ -292,7 +292,7 @@ class Sparse4DHead(BaseModule):
                     feature_maps,
                     metas,
                 )
-            elif op == "refine":
+            elif op == "refine":    # 更新 3D 框，输出类别与质量
                 anchor, cls, qt = self.layers[i](
                     instance_feature,
                     anchor,
@@ -306,7 +306,7 @@ class Sparse4DHead(BaseModule):
                 if len(prediction) == self.num_single_frame_decoder:
                     instance_feature, anchor = self.instance_bank.update(
                         instance_feature, anchor, cls
-                    )
+                    )   # 单帧阶段结束后，把历史实例插入当前候选 900 = 历史600 + 当前300
                     if (
                         dn_metas is not None
                         and self.sampler.num_temp_dn_groups > 0
@@ -329,14 +329,14 @@ class Sparse4DHead(BaseModule):
                             self.instance_bank.num_anchor,
                             self.instance_bank.mask,
                         )
-                anchor_embed = self.anchor_encoder(anchor)
+                anchor_embed = self.anchor_encoder(anchor)  # 框已经改变，下一轮采样和注意力需要使用新的几何编码
                 if (
                     len(prediction) > self.num_single_frame_decoder
                     and temp_anchor_embed is not None
                 ):
                     temp_anchor_embed = anchor_embed[
                         :, : self.instance_bank.num_temp_instances
-                    ]
+                    ]   # 历史注意力的几何编码会跟随当前框的优化结果更新，而历史语义特征仍然来自缓存
             else:
                 raise NotImplementedError(f"{op} is not supported.")
 
@@ -391,18 +391,18 @@ class Sparse4DHead(BaseModule):
             )
         output.update(
             {
-                "classification": classification,
-                "prediction": prediction,
-                "quality": quality,
-                "instance_feature": instance_feature,
-                "anchor_embed": anchor_embed,
+                "classification": classification,       # [bs, 900, num_classes] 类别
+                "prediction": prediction,               # [bs, 900, 11] 3D 框及速度
+                "quality": quality,                     # [bs, 900, 2] 质量分数
+                "instance_feature": instance_feature,   # [bs, 900, 256] 实例特征
+                "anchor_embed": anchor_embed,           # [bs, 900, 256] anchor 几何编码
             }
         )
 
         # cache current instances for temporal modeling
         self.instance_bank.cache(
             instance_feature, anchor, cls, metas, feature_maps
-        )
+        )   # 高置信度候选缓存
         if self.with_instance_id:
             instance_id = self.instance_bank.get_instance_id(
                 cls, anchor, self.decoder.score_threshold

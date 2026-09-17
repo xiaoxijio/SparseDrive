@@ -118,6 +118,18 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Optional single-process attach debugging; normal training never waits.
+    # Start with SPARSEDRIVE_DEBUG=1 and attach VS Code to localhost:9501.
+    if os.environ.get("SPARSEDRIVE_DEBUG") == "1":
+        if args.launcher != "none":
+            raise ValueError("Attach debugging requires --launcher none (one process).")
+        import debugpy
+
+        debugpy.listen(("127.0.0.1", 9501))
+        print("Waiting for debugger attach on 127.0.0.1:9501", flush=True)
+        debugpy.wait_for_client()
+        debugpy.breakpoint()
+
     cfg = Config.fromfile(args.config)
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)

@@ -60,14 +60,14 @@ class SparseDrive(BaseDetector):
 
     @auto_fp16(apply_to=("img",), out_fp32=True)
     def extract_feat(self, img, return_depth=False, metas=None):
-        bs = img.shape[0]
+        bs = img.shape[0]                   # img:[bs, 6, 3, 256, 704]
         if img.dim() == 5:  # multi-view
             num_cams = img.shape[1]
-            img = img.flatten(end_dim=1)
+            img = img.flatten(end_dim=1)    # img:[bs*6, 3, 256, 704]
         else:
             num_cams = 1
         if self.use_grid_mask:
-            img = self.grid_mask(img)
+            img = self.grid_mask(img)       # 数据增强，随机遮挡部分图像
         if "metas" in signature(self.img_backbone.forward).parameters:
             feature_maps = self.img_backbone(img, num_cams, metas=metas)
         else:
