@@ -180,12 +180,12 @@ class Sparse4DHead(BaseModule):
             and self.sampler.dn_metas["dn_anchor"].shape[0] != batch_size
         ):
             self.sampler.dn_metas = None
-        (
-            instance_feature,       # [bs, 900, 256] 当前候选的目标特征
-            anchor,                 # [bs, 900, 11]  当前候选的 3D 框及速度
-            temp_instance_feature,
-            temp_anchor,
-            time_interval,
+        (                           # 检测头                                  # 地图头
+            instance_feature,       # [bs, 900, 256] 当前候选的目标特征         # [bs, 100, 256] 当前候选地图线的特征
+            anchor,                 # [bs, 900, 11]  当前候选的 3D 框及速度     # [bs, 100, 40]  40 = 20 个二维点
+            temp_instance_feature,  # [bs, 600, 256] 历史缓存的目标特征         # None
+            temp_anchor,            # [bs, 600, 11]  历史缓存的 3D 框及速度     # None
+            time_interval,          # [bs]           帧间隔                   # [bs]           默认0.5
         ) = self.instance_bank.get(
             batch_size, metas, dn_metas=self.sampler.dn_metas
         )
@@ -248,8 +248,8 @@ class Sparse4DHead(BaseModule):
             )
             attn_mask[:num_free_instance, :num_free_instance] = False
             attn_mask[num_free_instance:, num_free_instance:] = dn_attn_mask
-
-        anchor_embed = self.anchor_encoder(anchor)  # [bs, 900, 256]  对 anchor 几何状态进行编码后的特征
+                                                    # 检测头                                            # 地图头
+        anchor_embed = self.anchor_encoder(anchor)  # [bs, 900, 256]  对 anchor 几何状态进行编码后的特征    # [bs, 100, 256]
         if temp_anchor is not None:
             temp_anchor_embed = self.anchor_encoder(temp_anchor)
         else:
@@ -281,7 +281,7 @@ class Sparse4DHead(BaseModule):
                     value=instance_feature,
                     query_pos=anchor_embed,
                     attn_mask=attn_mask,
-                )
+                )   # 检测头做编码拼接 | 地图头做编码相加
             elif op == "norm" or op == "ffn":
                 instance_feature = self.layers[i](instance_feature)
             elif op == "deformable":
@@ -391,9 +391,9 @@ class Sparse4DHead(BaseModule):
             )
         output.update(
             {
-                "classification": classification,       # [bs, 900, num_classes] 类别
-                "prediction": prediction,               # [bs, 900, 11] 3D 框及速度
-                "quality": quality,                     # [bs, 900, 2] 质量分数
+                "classification": classification,       # [bs, 900, 10] 类别                # [bs, 100, 3] 地图线类型
+                "prediction": prediction,               # [bs, 900, 11] 3D 框及速度          # [bs, 100, 40] 地图线点坐标
+                "quality": quality,                     # [bs, 900, 2] 质量分数              # None
                 "instance_feature": instance_feature,   # [bs, 900, 256] 实例特征
                 "anchor_embed": anchor_embed,           # [bs, 900, 256] anchor 几何编码
             }

@@ -40,6 +40,14 @@ class Visualizer:
         cfg = Config.fromfile(args.config)
         self.dataset = build_dataset(cfg.data.val)
         self.results = mmcv.load(args.result_path)
+        self.plot_choices = plot_choices
+        self.set_output(args.out_dir)
+
+    def set_output(self, out_dir):
+        self.out_dir = out_dir
+        self.combine_dir = os.path.join(out_dir, 'combine')
+        os.makedirs(self.combine_dir, exist_ok=True)
+        plot_choices = self.plot_choices
         self.bev_render = BEVRender(plot_choices, self.out_dir)
         self.cam_render = CamRender(plot_choices, self.out_dir)
 
@@ -59,24 +67,35 @@ class Visualizer:
         save_path = os.path.join(self.combine_dir, str(index).zfill(4) + '.jpg')
         cv2.imwrite(save_path, merge_image)
 
-    def image2video(self, fps=12, downsample=4):
-        imgs_path = glob.glob(os.path.join(self.combine_dir, '*.jpg'))
-        imgs_path = sorted(imgs_path)
-        img_array = []
-        for img_path in tqdm(imgs_path):
-            img = cv2.imread(img_path)
-            height, width, channel = img.shape
-            img = cv2.resize(img, (width//downsample, height //
-                             downsample), interpolation=cv2.INTER_AREA)
-            height, width, channel = img.shape
-            size = (width, height)
-            img_array.append(img)
-        out_path = os.path.join(self.out_dir, 'video.mp4')
-        out = cv2.VideoWriter(
-            out_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, size)
-        for i in range(len(img_array)):
-            out.write(img_array[i])
-        out.release()
+    def image2video(self, indices, fps=12, downsample=4):
+        # Only use frames rendered in this run, and stream to limit memory use.
+        out = None
+        try:
+            for index in tqdm(indices, desc='Encoding video'):
+                path = os.path.join(self.combine_dir, str(index).zfill(4) + '.jpg')
+                img = cv2.imread(path)
+                if img is None:
+                    raise RuntimeError('Cannot read image: ' + path)
+                height, width = img.shape[:2]
+                size = (width // downsample, height // downsample)
+                img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+                if out is None:
+                    out = cv2.VideoWriter(os.path.join(self.out_dir, 'video.mp4'),
+                                          cv2.VideoWriter_fourcc(*'mp4v'), fps, size)
+                    if not out.isOpened():
+                        raise RuntimeError('Cannot open video writer')
+                out.write(img)
+        finally:
+            if out is not None:
+                out.release()
+
+
+def group_scenes(data_infos):
+    """Group global dataset indices by scene, preserving dataset order."""
+    scenes = {}
+    for index, info in enumerate(data_infos):
+        scenes.setdefault(info['scene_token'], []).append(index)
+    return list(scenes.items())
 
 
 def parse_args():
@@ -91,20 +110,61 @@ def parse_args():
         '--out-dir', 
         default='vis',
         help='directory where visualize results will be saved')
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument('--num-scenes', type=int, help='Render first N complete scenes')
+    selection.add_argument('--scene-indices', type=int, nargs='+',
+                           help='Render selected scenes by zero-based index')
+    parser.add_argument('--list-scenes', action='store_true', help='List scenes without loading predictions')
+    parser.add_argument('--no-track', action='store_true', help='Hide historical boxes')
+    parser.add_argument('--interval', type=int, default=INTERVAL, help='Render every Nth frame')
     args = parser.parse_args()
+    if args.interval < 1 or (args.num_scenes is not None and args.num_scenes < 1):
+        parser.error('--interval and --num-scenes must be positive')
+    if not args.list_scenes and not args.result_path:
+        parser.error('--result-path is required for rendering')
 
     return args
 
 def main():
     args = parse_args()
-    visualizer = Visualizer(args, plot_choices)
+    if args.list_scenes:
+        cfg = Config.fromfile(args.config)
+        dataset = build_dataset(cfg.data.val)
+        for number, (token, indices) in enumerate(group_scenes(dataset.data_infos)):
+            print(f'{number}: {token} frames={len(indices)} indices={indices[0]}..{indices[-1]}')
+        return
 
-    for idx in tqdm(range(START, END, INTERVAL)):
-        if idx > len(visualizer.results):
-            break
-        visualizer.add_vis(idx)
-    
-    visualizer.image2video()
+    choices = dict(plot_choices)
+    if args.no_track:
+        choices['track'] = False
+    visualizer = Visualizer(args, choices)
+    if len(visualizer.results) != len(visualizer.dataset):
+        raise ValueError('Prediction count does not match validation dataset')
+    scenes = group_scenes(visualizer.dataset.data_infos)
+    if args.num_scenes is not None:
+        if args.num_scenes > len(scenes):
+            raise ValueError(f'Only {len(scenes)} scenes available')
+        selected = list(range(args.num_scenes))
+    else:
+        selected = args.scene_indices
+
+    if selected is None:
+        indices = list(range(START, min(END, len(visualizer.results)), args.interval))
+        for idx in tqdm(indices):
+            visualizer.add_vis(idx)
+        visualizer.image2video(indices)
+    else:
+        selected = list(dict.fromkeys(selected))
+        if any(i < 0 or i >= len(scenes) for i in selected):
+            raise ValueError(f'Scene indices must be between 0 and {len(scenes) - 1}')
+        for number in selected:
+            token, indices = scenes[number]
+            indices = indices[::args.interval]
+            visualizer.set_output(os.path.join(args.out_dir, f'scene_{number:03d}_{token}'))
+            print(f'Rendering scene {number}: {token}, {len(indices)} frames')
+            for idx in tqdm(indices):
+                visualizer.add_vis(idx)
+            visualizer.image2video(indices)
 
 if __name__ == '__main__':
     main()

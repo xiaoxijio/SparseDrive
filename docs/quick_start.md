@@ -11,7 +11,12 @@ conda activate sparsedrive
 sparsedrive_path="path/to/sparsedrive"
 cd ${sparsedrive_path}
 pip3 install --upgrade pip
-pip3 install torch==1.13.0+cu116 torchvision==0.14.0+cu116 torchaudio==0.13.0 --extra-index-url https://download.pytorch.org/whl/cu116
+# pip3 install torch==1.13.0+cu116 torchvision==0.14.0+cu116 torchaudio==0.13.0 --extra-index-url https://download.pytorch.org/whl/cu116
+python -m pip install torch==1.13.0+cu116 \
+    torchvision==0.14.0+cu116 \
+    torchaudio==0.13.0+cu116 \
+    -i https://mirrors.aliyun.com/pypi/simple/ \
+    -f https://mirrors.aliyun.com/pytorch-wheels/cu116/
 pip3 install -r requirement.txt
 ```
 
@@ -101,8 +106,12 @@ wget https://download.pytorch.org/models/resnet50-19c8e357.pth -O ckpt/resnet50-
 ### Commence training and testing
 ```bash
 # train
-sh scripts/train.sh
-
+# sh scripts/train.sh
+SPARSEDRIVE_DEBUG=1 CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. \
+  python tools/train.py \
+  projects/configs/sparsedrive_small_stage1_1gpu_debug.py \
+  --gpus 1 --no-validate --deterministic
+  
 # test
 sh scripts/test.sh
 ```

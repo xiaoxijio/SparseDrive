@@ -44,12 +44,12 @@ class SparseDriveHead(BaseModule):
         metas: dict,
     ):
         if self.task_config['with_det']:
-            det_output = self.det_head(feature_maps, metas)
+            det_output = self.det_head(feature_maps, metas) # [bs, 900, 10]
         else:
             det_output = None
 
         if self.task_config['with_map']:
-            map_output = self.map_head(feature_maps, metas)
+            map_output = self.map_head(feature_maps, metas) # [bs, 100, 3]
         else:
             map_output = None
         
