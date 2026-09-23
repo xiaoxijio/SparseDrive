@@ -1,6 +1,8 @@
 import os
 import glob
 import argparse
+import subprocess
+import tempfile
 from tqdm import tqdm
 
 import cv2
@@ -98,6 +100,38 @@ def group_scenes(data_infos):
     return list(scenes.items())
 
 
+def concat_videos(video_paths, output_path):
+    """Join compatible scene videos without re-encoding them."""
+    if not video_paths:
+        raise ValueError('No scene videos found to concatenate')
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    list_path = None
+    temporary_output = output_path + '.tmp.mp4'
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', prefix='scene_videos_',
+                                         dir=os.path.dirname(output_path), delete=False) as listing:
+            list_path = listing.name
+            for path in video_paths:
+                absolute = os.path.abspath(path).replace("'", "'\\''")
+                listing.write("file '{}'\n".format(absolute))
+        subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+                        '-f', 'concat', '-safe', '0', '-i', list_path,
+                        '-c', 'copy', '-movflags', '+faststart', temporary_output], check=True)
+        os.replace(temporary_output, output_path)
+    finally:
+        if list_path and os.path.exists(list_path):
+            os.remove(list_path)
+        if os.path.exists(temporary_output):
+            os.remove(temporary_output)
+    print('Combined {} scene videos: {}'.format(len(video_paths), output_path))
+
+
+def existing_scene_videos(out_dir):
+    return [os.path.join(out_dir, name, 'video.mp4')
+            for name in sorted(os.listdir(out_dir)) if name.startswith('scene_')
+            and os.path.isfile(os.path.join(out_dir, name, 'video.mp4'))]
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Visualize groundtruth and results')
@@ -112,6 +146,8 @@ def parse_args():
         help='directory where visualize results will be saved')
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument('--num-scenes', type=int, help='Render first N complete scenes')
+    selection.add_argument('--concat-only', action='store_true',
+                           help='Join all existing scene videos without rendering')
     selection.add_argument('--scene-indices', type=int, nargs='+',
                            help='Render selected scenes by zero-based index')
     parser.add_argument('--list-scenes', action='store_true', help='List scenes without loading predictions')
@@ -120,13 +156,17 @@ def parse_args():
     args = parser.parse_args()
     if args.interval < 1 or (args.num_scenes is not None and args.num_scenes < 1):
         parser.error('--interval and --num-scenes must be positive')
-    if not args.list_scenes and not args.result_path:
+    if not args.list_scenes and not args.concat_only and not args.result_path:
         parser.error('--result-path is required for rendering')
 
     return args
 
 def main():
     args = parse_args()
+    if args.concat_only:
+        concat_videos(existing_scene_videos(args.out_dir),
+                      os.path.join(args.out_dir, 'all_scenes.mp4'))
+        return
     if args.list_scenes:
         cfg = Config.fromfile(args.config)
         dataset = build_dataset(cfg.data.val)
@@ -157,6 +197,7 @@ def main():
         selected = list(dict.fromkeys(selected))
         if any(i < 0 or i >= len(scenes) for i in selected):
             raise ValueError(f'Scene indices must be between 0 and {len(scenes) - 1}')
+        video_paths = []
         for number in selected:
             token, indices = scenes[number]
             indices = indices[::args.interval]
@@ -165,6 +206,8 @@ def main():
             for idx in tqdm(indices):
                 visualizer.add_vis(idx)
             visualizer.image2video(indices)
+            video_paths.append(os.path.join(visualizer.out_dir, 'video.mp4'))
+        concat_videos(video_paths, os.path.join(args.out_dir, 'all_scenes.mp4'))
 
 if __name__ == '__main__':
     main()
