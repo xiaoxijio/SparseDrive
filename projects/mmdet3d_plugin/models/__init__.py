@@ -15,6 +15,7 @@ from .detection3d import (
 )
 from .map import *
 from .motion import *
+from .ep1 import *
 
 
 __all__ = [

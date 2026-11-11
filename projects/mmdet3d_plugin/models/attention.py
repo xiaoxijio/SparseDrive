@@ -16,12 +16,16 @@ import torch.utils.checkpoint as cp
 
 from einops import rearrange
 try:
-    from flash_attn.flash_attn_interface import flash_attn_unpadded_kvpacked_func
-    print('Use flash_attn_unpadded_kvpacked_func')
-except:
-    from flash_attn.flash_attn_interface import  flash_attn_varlen_kvpacked_func as flash_attn_unpadded_kvpacked_func
-    print('Use flash_attn_varlen_kvpacked_func')
-from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_unpadded_kvpacked_func
+    except ImportError:
+        from flash_attn.flash_attn_interface import (
+            flash_attn_varlen_kvpacked_func as flash_attn_unpadded_kvpacked_func)
+    from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
+except (ImportError, OSError):
+    # EP1 uses ExportableAttention and does not need this optional CUDA package.
+    # Keep a clear error when an original FlashAttention configuration is built.
+    flash_attn_unpadded_kvpacked_func = None
 
 
 def _in_projection_packed(q, k, v, w, b = None):
@@ -45,6 +49,9 @@ class FlashAttention(nn.Module):
     """
     def __init__(self, softmax_scale=None, attention_dropout=0.0, device=None, dtype=None):
         super().__init__()
+        if flash_attn_unpadded_kvpacked_func is None:
+            raise ImportError('MultiheadFlashAttention requires flash-attn. '
+                              'EP1 ExportableAttention works without flash-attn.')
         self.softmax_scale = softmax_scale
         self.dropout_p = attention_dropout
         self.fp16_enabled = True
