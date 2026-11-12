@@ -1,51 +1,28 @@
 """Fixed-size temporal inputs shared by the first and subsequent frames."""
 import torch
-from torch import nn
-from mmcv.cnn.bricks.registry import ATTENTION, PLUGIN_LAYERS
-from mmcv.runner import BaseModule
+from functools import wraps
+from mmcv.cnn.bricks.registry import PLUGIN_LAYERS
 from mmdet.models import HEADS
 
 from ..instance_bank import InstanceBank, topk
 from ..detection3d.detection3d_head import Sparse4DHead
+from ..attention import FlashMHA
 
 
-@ATTENTION.register_module()
-class ExportableAttention(BaseModule):
-    """Explicit MatMul/Softmax attention; no FlashAttention CUDA export op."""
-    def __init__(self, embed_dims, num_heads, batch_first=True, dropout=0.0,
-                 init_cfg=None):
-        super().__init__(init_cfg=init_cfg)
-        if not batch_first or embed_dims % num_heads:
-            raise ValueError('Expected batch_first and divisible head dimensions')
-        self.num_heads = num_heads
-        self.head_dim = embed_dims // num_heads
-        self.q_proj = nn.Linear(embed_dims, embed_dims)
-        self.k_proj = nn.Linear(embed_dims, embed_dims)
-        self.v_proj = nn.Linear(embed_dims, embed_dims)
-        self.out_proj = nn.Linear(embed_dims, embed_dims)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, query, key=None, value=None, identity=None,
-                query_pos=None, key_pos=None, attn_mask=None, **kwargs):
-        identity = query if identity is None else identity
-        key = query if key is None else key
-        value = key if value is None else value
-        query = query if query_pos is None else query + query_pos
-        key = key if key_pos is None else key + key_pos
-
-        def split(x):
-            return x.reshape(x.shape[0], -1, self.num_heads,
-                             self.head_dim).transpose(1, 2)
-        q, k, v = split(self.q_proj(query)), split(self.k_proj(key)), split(self.v_proj(value))
-        scores = (q * (self.head_dim ** -0.5)) @ k.transpose(-2, -1)
-        if attn_mask is not None:
-            if attn_mask.dtype == torch.bool:
-                scores = scores.masked_fill(attn_mask, float('-inf'))
-            else:
-                scores = scores + attn_mask
-        out = self.dropout(scores.softmax(-1)) @ v
-        out = out.transpose(1, 2).reshape(query.shape[0], query.shape[1], -1)
-        return identity + self.dropout(self.out_proj(out))
+def standard_attention_export(forward):
+    """Use standard attention only for this export call, then restore kernels."""
+    @wraps(forward)
+    def wrapped(self, *args, **kwargs):
+        states = [(module, module.export_mode) for module in self.modules()
+                  if isinstance(module, FlashMHA)]
+        try:
+            for module, _ in states:
+                module.export_mode = True
+            return forward(self, *args, **kwargs)
+        finally:
+            for module, previous in states:
+                module.export_mode = previous
+    return wrapped
 
 
 @PLUGIN_LAYERS.register_module()

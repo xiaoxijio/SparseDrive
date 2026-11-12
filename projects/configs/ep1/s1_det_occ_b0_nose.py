@@ -65,9 +65,9 @@ model = dict(
                 ['gnn', 'norm', 'deformable', 'ffn', 'norm', 'refine'] * num_single_frame_decoder
                 + ['temp_gnn', 'gnn', 'norm', 'deformable', 'ffn', 'norm', 'refine']
                 * (num_decoder - num_single_frame_decoder))[2:],
-            temp_graph_model=dict(type='ExportableAttention', embed_dims=embed_dims * 2,
+            temp_graph_model=dict(type='MultiheadFlashAttention', embed_dims=embed_dims * 2,
                                   num_heads=num_groups, batch_first=True, dropout=0.1),
-            graph_model=dict(type='ExportableAttention', embed_dims=embed_dims * 2,
+            graph_model=dict(type='MultiheadFlashAttention', embed_dims=embed_dims * 2,
                              num_heads=num_groups, batch_first=True, dropout=0.1),
             norm_layer=dict(type='LN', normalized_shape=embed_dims), 
             ffn=dict(type='AsymmetricFFN', in_channels=embed_dims * 2,

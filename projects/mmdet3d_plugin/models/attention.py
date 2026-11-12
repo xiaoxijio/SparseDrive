@@ -23,8 +23,8 @@ try:
             flash_attn_varlen_kvpacked_func as flash_attn_unpadded_kvpacked_func)
     from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
 except (ImportError, OSError):
-    # EP1 uses ExportableAttention and does not need this optional CUDA package.
-    # Keep a clear error when an original FlashAttention configuration is built.
+    # Keep registry imports usable without the optional CUDA package. Building
+    # a FlashAttention training module still requires the package explicitly.
     flash_attn_unpadded_kvpacked_func = None
 
 
@@ -51,7 +51,7 @@ class FlashAttention(nn.Module):
         super().__init__()
         if flash_attn_unpadded_kvpacked_func is None:
             raise ImportError('MultiheadFlashAttention requires flash-attn. '
-                              'EP1 ExportableAttention works without flash-attn.')
+                              'Install the matching flash-attn training dependency.')
         self.softmax_scale = softmax_scale
         self.dropout_p = attention_dropout
         self.fp16_enabled = True
@@ -115,6 +115,7 @@ class FlashMHA(nn.Module):
         self.embed_dim = embed_dim
         self.causal = causal
         self.bias = bias
+        self.export_mode = False
 
         self.num_heads = num_heads
         assert self.embed_dim % num_heads == 0, "self.kdim must be divisible by num_heads"
@@ -146,7 +147,25 @@ class FlashMHA(nn.Module):
         v = rearrange(v, 'b s (h d) -> b s h d', h=self.num_heads)
         kv = torch.stack([k, v], dim=2)
         
-        context, attn_weights = self.inner_attn(q, kv, key_padding_mask=key_padding_mask, causal=self.causal)
+        if self.export_mode or torch.onnx.is_in_onnx_export():
+            if self.causal:
+                raise ValueError('The EP1 ONNX path supports non-causal attention only')
+            # Same projected Q/K/V and output weights as FlashAttention. Only
+            # the execution kernel changes; no second learned attention branch.
+            qh = q.transpose(1, 2).float()
+            kh = k.transpose(1, 2).float()
+            vh = v.transpose(1, 2).float()
+            scores = (qh * (self.head_dim ** -0.5)) @ kh.transpose(-2, -1)
+            if key_padding_mask is not None:
+                # The original FlashAttention wrapper uses True for VALID keys.
+                scores = scores.masked_fill(~key_padding_mask[:, None, None, :].bool(), float('-inf'))
+            probabilities = torch.softmax(scores, dim=-1)
+            probabilities = torch.nn.functional.dropout(
+                probabilities, p=self.inner_attn.dropout_p, training=self.training)
+            context = (probabilities @ vh).transpose(1, 2).to(q.dtype)
+            attn_weights = None
+        else:
+            context, attn_weights = self.inner_attn(q, kv, key_padding_mask=key_padding_mask, causal=self.causal)
         return self.out_proj(rearrange(context, 'b s h d -> b s (h d)')), attn_weights
 
 
@@ -205,6 +224,22 @@ class MultiheadFlashAttention(BaseModule):
         self.proj_drop = nn.Dropout(proj_drop)
         self.dropout_layer = build_dropout(
             dropout_layer) if dropout_layer else nn.Identity()
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # Compatibility with the earlier EP1 ExportableAttention checkpoints.
+        # Concatenation preserves Q/K/V projection values without retraining.
+        if prefix + 'q_proj.weight' in state_dict:
+            for suffix in ('weight', 'bias'):
+                names = [prefix + letter + '_proj.' + suffix for letter in ('q', 'k', 'v')]
+                if all(name in state_dict for name in names):
+                    state_dict[prefix + 'attn.in_proj_' + suffix] = torch.cat(
+                        [state_dict.pop(name) for name in names], dim=0)
+                old = prefix + 'out_proj.' + suffix
+                if old in state_dict:
+                    state_dict[prefix + 'attn.out_proj.' + suffix] = state_dict.pop(old)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                     missing_keys, unexpected_keys, error_msgs)
 
     @deprecated_api_warning({'residual': 'identity'},
                             cls_name='MultiheadAttention')

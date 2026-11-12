@@ -11,6 +11,7 @@
 | 检测 FPN | 输入上述四级特征，输出四级 256 通道 |
 | 检测 query | 共 450；首轮单帧解码后使用历史 300 + 当前 top 150；首帧保持 450 个当前候选 |
 | 检测解码器 | 6 层，256 维，保留 quality 分支；最终最多输出 300 个检测框 |
+| 检测注意力 | 训练/普通 GPU 推理使用原 MultiheadFlashAttention；导出用同一套打包 QKV/输出权重执行标准算子 |
 | map/tracking/motion/planning | 不构建对应头，不加载 map/future 标注，不分配 tracking ID |
 | OCC 图像 neck | 共享骨干的 112/1280 两级特征融合，输出 stride 16、256 通道 |
 | OCC 视图变换 | LSS 深度分布 × 64 通道 context，按相机投影累加到 BEV |
@@ -50,14 +51,15 @@ data/kmeans/kmeans_det_900.npy
 ```bash
 conda activate sparsedrive
 cd /path/to/SparseDrive
-python -m pip install -r requirement_ep1.txt
+python -m pip install -r requirement.txt
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 python tools/prepare_ep1_anchors.py
-python tools/smoke_ep1.py projects/configs/ep1/s1_det_occ_b0_nose.py --steps 2
 bash scripts/train_ep1_s1.sh
 ```
 
-EP1 不需要编译 `projects/mmdet3d_plugin/ops`，也不需要安装 flash-attn；原有配置若选择 MultiheadFlashAttention，仍需安装原来的 flash-attn。
+本配置的特征采样仍使用 `use_deformable_func=False`，不要求编译 `projects/mmdet3d_plugin/ops`。检测注意力已恢复原来的 `MultiheadFlashAttention`，训练和普通 GPU 推理需要 flash-attn 2.3.2；`requirement.txt` 已加入对应 Python 3.8 / torch 1.13 / CUDA 11.6 的 wheel。
+
+导出不训练第二套注意力。`forward_export` 在调用期间将原 FlashMHA 切到标准 MatMul/Softmax，再恢复原内核；权重沿用原 `attn.in_proj_weight/bias` 和 `attn.out_proj.*`。FP16 Flash 内核与 FP32 导出路径存在正常的舍入差异，自注意力和历史交叉注意力均有输出/梯度对比测试。之前 EP1 的独立 `q_proj/k_proj/v_proj` checkpoint 会在加载时拼接为原打包 QKV 权重；旧 `out_proj` 同时迁移，支持严格加载。
 
 默认 `pretrained=None`，可完全离线构建，但从头训练。建议正式训练前准备匹配的 no-SE 骨干预训练权重，并在配置中填写 `model.img_backbone.pretrained`。也支持 torchvision B0 初始化匹配层，SE/classifier 参数会被忽略；这只是初始化，不是指南里的已训练 no-SE 权重。官方 ResNet50 stage1/stage2 checkpoint 与本模型不兼容，不能作为完整模型直接恢复。
 
@@ -111,26 +113,14 @@ OCC 的 scatter_add 在 CUDA 有浮点加法顺序差异，所以测试对 OCC l
 
 ```bash
 PYTHONPATH=. python -m unittest discover -s tests -p test_ep1.py -v
-PYTHONPATH=. python tools/smoke_ep1.py projects/configs/ep1/s1_det_occ_b0_nose.py --steps 2
-PYTHONPATH=. python tools/profile_ep1.py projects/configs/ep1/s1_det_occ_b0_nose.py
+PYTHONPATH=. python -m unittest discover -s tests -p test_ep1_attention.py -v
 ```
 
 短验证覆盖真实图像/检测/OCC 标签的前后向梯度、无效缓存隔离、正常历史影响、超时重置，以及标签中心裁剪、ego-motion、混合 batch 场景重置、LSS 累加/坐标轴/梯度、空可见掩码和替换 box block 的数学等价性。ONNX 脚本对同一个文件验证首帧、历史帧（包含非单位 ego-motion）和新场景重置。
 
 默认模型参数量 40,533,182；原 stage1（检测+map，ResNet50）为 75,675,882，任务组合不同，不能将参数比当作同任务速度比。本模型检测 head 21,182,895、OCC 分支 12,297,484，是下一步压缩重点。
 
-2026-11-11 在 3090 的单样本验证：真实训练数据两步反向传播通过，另用正式 `tools/train.py`（FP16 optimizer hook）跑完两次迭代；未进行长训。5 项回归测试通过。随机权重 ONNX 约 151 MiB，6 个 Resize 都是 pytorch_half_pixel，首帧/历史帧/新场景 ORT 最大绝对误差 <1e-4；不是已经训练好的可用权重，且未在 LQ560 上编译。
-
-当前 GPU 上随机权重、batch 1、FP32 张量、10 次推理的中位耗时：
-
-| 候选 | 参数量 | 3090 耗时 |
-| --- | ---: | ---: |
-| 默认：检测 256 维、6 层 | 40.53 M | 52.89 ms |
-| 检测改为 128 维、6 层 | 22.93 M | 40.56 ms |
-| 检测 128 维、3 层 | 19.97 M | 29.84 ms |
-| 再把 OCC encoder 改成 128/128/128 | 10.25 M | 29.21 ms |
-
-这几项候选仅由 profiler 在内存构建，正式 s1 配置仍是第一行。测量不含读取图片和图外后处理，也不代表 4090 或 NPU 耗时；没有训练后的精度结果。最后一项参数下降较大但当前 GPU 延迟收益小，不能仅凭参数量决定。验证和导出产物默认写入 `work_dirs/ep1/`，可通过上述命令按需重新生成，该目录不会随 git clone 分发。
+恢复 FlashAttention 后在 3090 的单样本验证：真实训练数据两步反向传播通过，8 项回归测试通过，包括原 Flash 内核调用、共享权重输出/梯度比较、旧权重加载和导出后内核恢复。随机权重 ONNX 的首帧/历史帧/新场景 ORT 最大绝对误差约 2.51e-4，6 个 Resize 均为 pytorch_half_pixel；这不代表训练后精度或 LQ560 板端性能，尚未进行长训和 NPU 编译。
 
 建议按以下顺序做消融，每次都看检测 mAP/NDS、小目标召回、OCC mIoU（17 个非 free-space 类）以及目标板延迟：
 
@@ -139,5 +129,3 @@ PYTHONPATH=. python tools/profile_ep1.py projects/configs/ep1/s1_det_occ_b0_nose
 3. OCC BEV encoder 的 128/256/512→128/128/128，neck 已经是 128，但 encoder 本身仍占较多参数。该项需要单独验证 OCC 精度。
 4. 检测减少 stride-4 大特征图或采样点（13→7），并同步更改 DenseDepth 与训练 gt_depth；重点检查远处小目标和行人的召回。
 5. INT8/QAT、Conv-BN 融合、固定标定的投影/池化索引预计算。优先 profile 真正的板端算子，尤其 GridSample、pooling、attention/softmax，不以参数量代替板端测速。
-
-`profile_ep1.py` 只在当前 GPU、随机权重、batch 1 上测前三项的候选参数量/延迟，不会修改正式配置，不进行正式训练，不能据此声称精度保持或四卡训练吞吐。

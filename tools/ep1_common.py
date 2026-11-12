@@ -1,4 +1,4 @@
-"""Shared setup for EP1 smoke tests and ONNX export."""
+"""Shared setup for EP1 ONNX export."""
 import logging
 import torch
 from mmcv import Config

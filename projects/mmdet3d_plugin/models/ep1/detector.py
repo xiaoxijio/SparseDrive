@@ -3,6 +3,7 @@ import torch
 from mmcv.runner import auto_fp16
 from mmdet.models import DETECTORS, build_head, build_neck
 from ..sparsedrive import SparseDrive
+from .temporal import standard_attention_export
 
 
 @DETECTORS.register_module()
@@ -47,6 +48,7 @@ class SparseDriveDetOcc(SparseDrive):
             result['occ_pred'] = prediction
         return [{'img_bbox': result} for result in results]
 
+    @standard_attention_export
     def forward_export(self, img, projection_mat, image_wh, occ_img2ego,
                        history_feature, history_anchor, history_confidence,
                        history_transform, time_interval, history_valid):
