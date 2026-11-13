@@ -25,12 +25,15 @@ def load_model(config_path, checkpoint=None, device='cuda:0'):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     cfg = Config.fromfile(config_path)
+    initialization = checkpoint or cfg.get('load_from')
+    if checkpoint:
+        cfg.model.img_backbone.pretrained = None
     model = build_detector(cfg.model)
     model.init_weights()
-    if checkpoint:
-        # Architecture changed; silently loading an official stage-1 checkpoint
-        # would leave major branches random. Require this architecture's weights.
-        load_checkpoint(model, checkpoint, map_location='cpu', strict=True)
+    if initialization:
+        # A combined S1 initialization and a trained S1 checkpoint both contain
+        # the complete architecture. Never partially accept an old stage1 model.
+        load_checkpoint(model, initialization, map_location='cpu', strict=True)
     model.to(device)
     return cfg, model
 

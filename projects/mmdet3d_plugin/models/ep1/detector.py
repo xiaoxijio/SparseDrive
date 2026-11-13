@@ -3,15 +3,13 @@ import torch
 from mmcv.runner import auto_fp16
 from mmdet.models import DETECTORS, build_head, build_neck
 from ..sparsedrive import SparseDrive
-from .temporal import standard_attention_export
+from .temporal import standard_ops_export
 
 
 @DETECTORS.register_module()
 class SparseDriveDetOcc(SparseDrive):
     def __init__(self, occ_img_neck, occ_branch, **kwargs):
         super().__init__(**kwargs)
-        if self.use_deformable_func:
-            raise ValueError('EP1 uses the exportable grid_sample aggregation path')
         if self.head.task_config.get('with_map') or self.head.task_config.get('with_motion_plan'):
             raise ValueError('EP1 is detection + OCC only')
         self.occ_img_neck = build_neck(occ_img_neck)
@@ -29,9 +27,15 @@ class SparseDriveDetOcc(SparseDrive):
         occupancy = self.occ_img_neck(backbone_features[-2:])
         return detection, occupancy
 
+    def detection_features(self, feature_maps):
+        if self.use_deformable_func:
+            from ...ops import feature_maps_format
+            return feature_maps_format(feature_maps)
+        return feature_maps
+
     def forward_train(self, img, **data):
         feature_maps, occ_feature = self.extract_shared_features(img)
-        losses = self.head.loss(self.head(feature_maps, data), data)
+        losses = self.head.loss(self.head(self.detection_features(feature_maps), data), data)
         occ_logits = self.occ_branch(occ_feature, data['occ_img2ego'])
         losses.update(self.occ_branch.loss(occ_logits, data['voxel_semantics'], data['mask_camera']))
         if self.depth_branch is not None and 'gt_depth' in data:
@@ -41,14 +45,14 @@ class SparseDriveDetOcc(SparseDrive):
 
     def simple_test(self, img, **data):
         feature_maps, occ_feature = self.extract_shared_features(img)
-        results = self.head.post_process(self.head(feature_maps, data), data)
+        results = self.head.post_process(self.head(self.detection_features(feature_maps), data), data)
         occ_logits = self.occ_branch(occ_feature, data['occ_img2ego'])
         predictions = occ_logits.argmax(-1).to(torch.uint8).cpu().numpy()
         for result, prediction in zip(results, predictions):
             result['occ_pred'] = prediction
         return [{'img_bbox': result} for result in results]
 
-    @standard_attention_export
+    @standard_ops_export
     def forward_export(self, img, projection_mat, image_wh, occ_img2ego,
                        history_feature, history_anchor, history_confidence,
                        history_transform, time_interval, history_valid):

@@ -8,7 +8,7 @@ plugin_dir = 'projects/mmdet3d_plugin/'
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 work_dir = './work_dirs/ep1/s1_det_occ_b0_nose'
-load_from = None
+load_from = 'ckpt/s1_det_occ_init.pth'
 resume_from = None
 workflow = [('train', 1)]
 fp16 = dict(loss_scale=32.0)
@@ -34,16 +34,17 @@ task_config = dict(with_det=True, with_map=False, with_motion_plan=False)
 model = dict(
     type='SparseDriveDetOcc',
     use_grid_mask=True,
-    use_deformable_func=False,
-    img_backbone=dict(type='EfficientNetB0NoSE', pretrained=None, with_cp=True),
+    use_deformable_func=True,
+    img_backbone=dict(type='EfficientNetB0NoSE',
+                      pretrained=None, norm_eval=True, with_cp=True),
     img_neck=dict(type='FPN', in_channels=[24, 40, 112, 1280],
                   out_channels=embed_dims, num_outs=4, start_level=0,
-                  upsample_cfg=dict(mode='bilinear', align_corners=False)),
+                  upsample_cfg=dict(mode='nearest')),
     occ_img_neck=dict(type='OccImageNeck', in_channels=[112, 1280], out_channels=256),
     occ_branch=dict(type='FlashOccBranch', grid_config=grid_config,
                     input_size=input_shape[::-1], in_channels=256, view_channels=64,
                     bev_channels=[128, 256, 512], out_channels=128,
-                    Dz=16, num_classes=18, use_mask=True, loss_weight=1.0),
+                    Dz=16, num_classes=18, use_mask=True, loss_weight=1.0, norm_eval=True),
     depth_branch=dict(type='DenseDepthNet', embed_dims=embed_dims,
                       num_depth_layers=3, loss_weight=0.2),
     head=dict(
@@ -77,7 +78,7 @@ model = dict(
             deformable_model=dict(
                 type='DeformableFeatureAggregation', embed_dims=embed_dims,
                 num_groups=num_groups, num_levels=4, num_cams=6, attn_drop=0.15,
-                use_deformable_func=False, use_camera_embed=True, residual_mode='cat',
+                use_deformable_func=True, match_cuda_sampling=True, use_camera_embed=True, residual_mode='cat',
                 kps_generator=dict(type='ExportableBoxKeyPoints',
                                    num_learnable_pts=6,
                                    fix_scale=[[0, 0, 0], [0.45, 0, 0], [-0.45, 0, 0],

@@ -7,21 +7,28 @@ from mmdet.models import HEADS
 from ..instance_bank import InstanceBank, topk
 from ..detection3d.detection3d_head import Sparse4DHead
 from ..attention import FlashMHA
+from ..blocks import DeformableFeatureAggregation
 
 
-def standard_attention_export(forward):
-    """Use standard attention only for this export call, then restore kernels."""
+def standard_ops_export(forward):
+    """Use standard attention/sampling only for export; restore GPU kernels."""
     @wraps(forward)
     def wrapped(self, *args, **kwargs):
-        states = [(module, module.export_mode) for module in self.modules()
-                  if isinstance(module, FlashMHA)]
+        states = []
+        for module in self.modules():
+            if isinstance(module, FlashMHA):
+                states.append((module, "export_mode", module.export_mode, True))
+            elif isinstance(module, DeformableFeatureAggregation):
+                states.append((module, "use_deformable_func", module.use_deformable_func, False))
+            elif isinstance(module, PaddedSparse4DHead):
+                states.append((module, "export_mode", module.export_mode, True))
         try:
-            for module, _ in states:
-                module.export_mode = True
+            for module, name, previous, exported in states:
+                setattr(module, name, exported)
             return forward(self, *args, **kwargs)
         finally:
-            for module, previous in states:
-                module.export_mode = previous
+            for module, name, previous, exported in states:
+                setattr(module, name, previous)
     return wrapped
 
 
@@ -31,8 +38,8 @@ class PaddedInstanceBank(InstanceBank):
 
     Export callers pass external state tensors in ``metas['history_*']``.
     Normal PyTorch training/inference uses the ordinary internal frame cache.
-    Invalid history is zeroed and its temporal attention contribution is gated
-    in PaddedSparse4DHead. No row is masked entirely to -inf in a softmax.
+    Invalid history is zeroed; PaddedSparse4DHead falls back to the original
+    current-frame self-attention. No row is masked entirely to -inf.
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -110,8 +117,25 @@ class PaddedInstanceBank(InstanceBank):
 
 @HEADS.register_module()
 class PaddedSparse4DHead(Sparse4DHead):
-    def graph_model(self, index, query, *args, **kwargs):
-        out = super().graph_model(index, query, *args, **kwargs)
-        if self.operation_order[index] == 'temp_gnn':
-            out = torch.where(self.instance_bank.mask[:, None, None], out, query)
-        return out
+    # The export wrapper selects both tensor paths without Python frame branches.
+    export_mode = False
+
+    def graph_model(self, index, query, key=None, value=None,
+                    query_pos=None, key_pos=None, **kwargs):
+        if self.operation_order[index] != 'temp_gnn':
+            return super().graph_model(index, query, key, value,
+                                       query_pos=query_pos, key_pos=key_pos, **kwargs)
+        valid = self.instance_bank.mask
+        # Normal GPU execution avoids calculating an unused attention path.
+        if not self.export_mode:
+            if valid.all():
+                return super().graph_model(index, query, key, value,
+                                           query_pos=query_pos, key_pos=key_pos, **kwargs)
+            if not valid.any():
+                return super().graph_model(index, query,
+                                           query_pos=query_pos, **kwargs)
+        history = super().graph_model(index, query, key, value,
+                                      query_pos=query_pos, key_pos=key_pos, **kwargs)
+        # Match Sparse4DHead with no cache: key/value=None -> current query.
+        current = super().graph_model(index, query, query_pos=query_pos, **kwargs)
+        return torch.where(valid[:, None, None], history, current)

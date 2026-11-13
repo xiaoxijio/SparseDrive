@@ -3,7 +3,9 @@ import unittest
 from unittest.mock import patch
 import torch
 from projects.mmdet3d_plugin.models.attention import MultiheadFlashAttention
-from projects.mmdet3d_plugin.models.ep1.temporal import standard_attention_export
+from projects.mmdet3d_plugin.models.blocks import DeformableFeatureAggregation
+from projects.mmdet3d_plugin.ops import feature_maps_format
+from projects.mmdet3d_plugin.models.ep1.temporal import standard_ops_export
 
 
 @unittest.skipUnless(torch.cuda.is_available(), 'FlashAttention requires CUDA')
@@ -46,20 +48,55 @@ class AttentionChecks(unittest.TestCase):
         for key, expected in original.items():
             torch.testing.assert_close(self.module.state_dict()[key], expected, rtol=0, atol=0)
 
+    def make_sampling(self):
+        return DeformableFeatureAggregation(
+            embed_dims=32, num_groups=4, num_levels=2, num_cams=2,
+            attn_drop=0., use_deformable_func=True, match_cuda_sampling=True,
+            kps_generator=dict(type="ExportableBoxKeyPoints", num_learnable_pts=2,
+                               fix_scale=[[0, 0, 0]])).cuda().eval()
+
+    def test_cuda_sampling_outputs_and_gradients(self):
+        module = self.make_sampling()
+        features = [torch.randn(4, 2, 32, n, n, device="cuda", requires_grad=True)
+                    for n in (8, 4)]
+        query = torch.randn(4, 5, 32, device="cuda", requires_grad=True)
+        embedding = torch.randn_like(query)
+        anchor = torch.zeros(4, 5, 11, device="cuda")
+        # Cover image interior, boundaries, and points outside both sides.
+        anchor[:, :, 0] = torch.tensor([0., 4., -4., 8., -8.], device="cuda")
+        anchor[:, :, 2] = 5
+        anchor[:, :, 7] = 1
+        projection = torch.eye(4, device="cuda")[None, None].repeat(4, 2, 1, 1)
+        projection[:, :, 0, 0] = projection[:, :, 1, 1] = 20
+        projection[:, :, 0, 2] = projection[:, :, 1, 2] = 16
+        meta = dict(projection_mat=projection,
+                    image_wh=torch.full((4, 2, 2), 32., device="cuda"))
+        fused = module(query, anchor, embedding, feature_maps_format(features), meta)
+        fused_grads = torch.autograd.grad(fused.sum(), [query] + features)
+        module.use_deformable_func = False
+        reference = module(query, anchor, embedding, features, meta)
+        reference_grads = torch.autograd.grad(reference.sum(), [query] + features)
+        torch.testing.assert_close(fused, reference, rtol=1e-4, atol=1e-5)
+        for actual, expected in zip(fused_grads, reference_grads):
+            torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
+
     def test_export_switch_restores_kernel_after_exception(self):
         class Wrapper(torch.nn.Module):
-            def __init__(self, module):
+            def __init__(self, module, sampling):
                 super().__init__()
                 self.attention = module
+                self.sampling = sampling
 
-            @standard_attention_export
+            @standard_ops_export
             def forward(self):
                 assert self.attention.attn.export_mode
+                assert not self.sampling.use_deformable_func
                 raise RuntimeError('intentional')
-        wrapper = Wrapper(self.module)
+        wrapper = Wrapper(self.module, self.make_sampling())
         with self.assertRaisesRegex(RuntimeError, 'intentional'):
             wrapper()
         self.assertFalse(self.module.attn.export_mode)
+        self.assertTrue(wrapper.sampling.use_deformable_func)
 
 
 if __name__ == '__main__':

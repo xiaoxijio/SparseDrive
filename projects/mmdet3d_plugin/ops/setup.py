@@ -55,6 +55,10 @@ if __name__ == "__main__":
                     f"src/deformable_aggregation_cuda.cu",
                 ],
             ),
+            make_cuda_ext(
+                "bev_pool_v2_ext", module=".",
+                sources=["src/bev_pool.cpp", "src/bev_pool_cuda.cu"],
+            ),
         ],
         cmdclass={"build_ext": BuildExtension},
     )

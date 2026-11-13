@@ -58,6 +58,7 @@ class DeformableFeatureAggregation(BaseModule):
         use_deformable_func=False,
         use_camera_embed=False,
         residual_mode="add",
+        match_cuda_sampling=False,
     ):
         super(DeformableFeatureAggregation, self).__init__()
         if embed_dims % num_groups != 0:
@@ -76,6 +77,7 @@ class DeformableFeatureAggregation(BaseModule):
         self.use_deformable_func = use_deformable_func
         self.attn_drop = attn_drop
         self.residual_mode = residual_mode
+        self.match_cuda_sampling = match_cuda_sampling
         self.proj_drop = nn.Dropout(proj_drop)
         kps_generator["embed_dims"] = embed_dims
         self.kps_generator = build_from_cfg(kps_generator, PLUGIN_LAYERS)
@@ -151,6 +153,7 @@ class DeformableFeatureAggregation(BaseModule):
                 key_points,
                 metas["projection_mat"],
                 metas.get("image_wh"),
+                strict_image_bounds=self.match_cuda_sampling,
             )
             features = self.multi_view_level_fusion(features, weights)
             features = features.sum(dim=2)  # fuse multi-point features
@@ -218,6 +221,7 @@ class DeformableFeatureAggregation(BaseModule):
         key_points: torch.Tensor,
         projection_mat: torch.Tensor,
         image_wh: Optional[torch.Tensor] = None,
+        strict_image_bounds=False,
     ) -> torch.Tensor:
         num_levels = len(feature_maps)
         num_cams = feature_maps[0].shape[1]
@@ -226,6 +230,9 @@ class DeformableFeatureAggregation(BaseModule):
         points_2d = DeformableFeatureAggregation.project_points(
             key_points, projection_mat, image_wh
         )
+        # The original CUDA kernel rejects normalized x/y <= 0 or >= 1.
+        # grid_sample alone blends zero padding at these exact boundaries.
+        valid = ((points_2d > 0) & (points_2d < 1)).all(dim=-1)
         points_2d = points_2d * 2 - 1
         points_2d = points_2d.flatten(end_dim=1)
 
@@ -243,6 +250,8 @@ class DeformableFeatureAggregation(BaseModule):
             0, 4, 1, 2, 5, 3
         )  # bs, num_anchor, num_cams, num_levels, num_pts, embed_dims
 
+        if strict_image_bounds:
+            features = features * valid.permute(0, 2, 1, 3)[:, :, :, None, :, None].to(features)
         return features
 
     def multi_view_level_fusion(

@@ -1,131 +1,121 @@
-# EP1 S1：SparseDrive 检测 + FlashOCC
+# EP1 S1：SparseDrive 检测 + SDK 优化 FlashOCC
 
-配置：`projects/configs/ep1/s1_det_occ_b0_nose.py`。`s1` 表示 stage 1；后续 stage 2 再新增 `s2` 配置，本次没有 motion/planning。
+配置：`projects/configs/ep1/s1_det_occ_b0_nose.py`。只训练 stage1；检测和 OCC 共享骨干，无 map、tracking ID、motion/planning。
 
-## 模型与数据
+## 网络与 SDK 对应关系
 
-| 部分 | 本次实现 |
+参考 LQ560 SDK `SPC060/samples/app/vision_occ/evaluate/FlashOCC_Board/` 的优化配置 `configs/flashocc/flashocc-r50-M0-opt.py`，以及《LQ560V200 NPU工具使用指南》的优化要求。
+
+| S1 模块 | SDK 对应模块 / 配置 |
 | --- | --- |
-| 共享图像骨干 | torchvision EfficientNet-B0，移除所有 SqueezeExcitation；不含分类器 |
-| 骨干输出 | stride 4/8/16/32，通道 24/40/112/1280 |
-| 检测 FPN | 输入上述四级特征，输出四级 256 通道 |
-| 检测 query | 共 450；首轮单帧解码后使用历史 300 + 当前 top 150；首帧保持 450 个当前候选 |
-| 检测解码器 | 6 层，256 维，保留 quality 分支；最终最多输出 300 个检测框 |
-| 检测注意力 | 训练/普通 GPU 推理使用原 MultiheadFlashAttention；导出用同一套打包 QKV/输出权重执行标准算子 |
-| map/tracking/motion/planning | 不构建对应头，不加载 map/future 标注，不分配 tracking ID |
-| OCC 图像 neck | 共享骨干的 112/1280 两级特征融合，输出 stride 16、256 通道 |
-| OCC 视图变换 | LSS 深度分布 × 64 通道 context，按相机投影累加到 BEV |
-| OCC BEV encoder | ResNet stages 128/256/512；FPN-LSS 融合及上采样后卷积均为 128 通道 |
-| OCC predictor | `Linear(128,128) -> Softplus -> Linear(128,18*16)` |
-| OCC 输出 | `[B,128,128,16,18]` logits；普通推理同时返回 `[128,128,16]` uint8 类别 |
-| OCC 网格 | x/y `[-25.6,25.6,0.4]`；z `[-1,5.4,0.4]`，16 格 |
-| LSS 配置 | z `[-1,5.4,6.4]` 合并为单层 BEV；depth `[1,45,1]`，44 格 |
+| `EfficientNetB0NoSE` | `EfficientNetB0HZ`，无 SE、ReLU6，无 stochastic depth；增加 stride 4/8 两个中间输出供检测使用 |
+| 检测 FPN | 原 SparseDrive FPN，输入 24/40/112/1280，输出四级 256；保持 nearest |
+| `OccImageNeck` | SDK `CustomFPN`，输入 112/1280，输出 stride16、256 通道；bilinear、align_corners=False |
+| `LSSViewTransform` | SDK LSS 深度/context 预测，44 个深度格、64 通道 context；训练使用原 BEVPoolv2 CUDA 聚合 |
+| `BEVEncoder.backbone` | SDK `CustomResNet`，三个阶段 128/256/512，各两个 BasicBlock；下采样分支为带 bias 的 3×3 卷积 |
+| `BEVEncoder.neck` | SDK `FPN_LSS`，输入 640，输出128，channels_factor=1；保留原 Conv/BN/ReLU 结构 |
+| `BEVOccHead2D` | 3×3 final_conv，`Linear(128,128) -> Softplus -> Linear(128,18*16)`，按指南和 SDK 优化 ONNX 的预测结构 |
 
-按照本机《LQ560V200 NPU工具使用指南》FlashOCC 章节（117–123 页）实现 128 通道 BEV neck、128×128 网格和不扩张隐藏维度的 Softplus predictor。LSS/2D-BEV/channel-to-height 结构参考 [FlashOCC](https://github.com/Yzichen/FlashOCC)。本实现使用本仓库的 mmdet registry，不依赖安装另一个项目的 mmdet3d，也不直接复用其他项目的权重。
+`sdk_blocks.py` 中 CustomFPN、CustomResNet、FPN_LSS 从上述 SDK 源码移植，只适配 import 和移除 registry 装饰器，类主体保持一致。预测器采用用户明确指定的两层 Linear，而不是某些 SDK 源文件中的实验性单 Linear 版本。
 
-检测仍在 lidar 坐标下。Occ3D 标签在关键帧 ego 坐标下，通过 `occ_ego2lidar` 和增强后的 `lidar2img` 求逆得到 `occ_img2ego`，避免直接把 lidar 网格当成 ego 网格。图像 resize/crop/flip/rotation 都体现在投影矩阵中；本配置保持 `rot3d_range=[0,0]`，防止 3D 框与未旋转的 OCC 标签失配。
+骨干四级输出为 stride 4/8/16/32，通道24/40/112/1280。检测仍使用原 MultiheadFlashAttention 和融合 CUDA 特征采样；450个候选，首轮单帧解码后使用历史300 + 当前top150，6层decoder、256维、13个采样点，最终最多输出300个框。
 
-现有 `gts/scene-name/sample-token/labels.npz` 是 200×200×16、范围 [-40,40] 的标签，训练/评测会取 `[36:164,36:164,:]` 中心裁剪，保留 0.4 m 体素及类别编号。不要把类别图双线性缩放到 128×128。已经预裁剪到 128 的其他数据，需要同步调整 `occ_source_grid`，不能混用。
+OCC 网格为 x/y `[-25.6,25.6,0.4]`，128×128；标签 z `[-1,5.4,0.4]`，16格、18类。LSS z `[-1,5.4,6.4]` 折叠成一层 BEV，depth `[1,45,1]`。输出 `[B,128,128,16,18]`。保留 camera mask 下交叉熵，loss_weight=1，无类别平衡。
 
-检测范围仍沿用原配置的 55 m 过滤；±25.6 m 仅约束 OCC，二者不是同一个范围。
+## 组合预训练初始化
 
-## 四卡租赁服务器训练
+默认配置 `load_from='ckpt/s1_det_occ_init.pth'`，不再只加载骨干。该文件包含本架构的完整初始状态，可由 runner 正常加载；`resume_from` 仍优先恢复训练。骨干的独立 `pretrained` 设为 None，避免重复加载或迁移时依赖旧的14MB骨干文件。
 
-目标硬件为用户指定的 4 张、每张 32 GB GPU。默认每卡 batch=4，总 batch=16，AdamW 学习率 1e-4（从原全局 batch 64 / lr 4e-4 线性缩放）。每卡 2 个 DataLoader worker；训练 100 个等效 epoch，每 epoch 1758 iter，每 10 epoch 验证/存档，保留 3 份 checkpoint。实际显存占用需在租赁机上确认，3090 的单样本测试不等于四卡容量测量。
+| 目标 | 来源 | 迁移张量 |
+| --- | --- | --- |
+| 共享 SDK B0-noSE 骨干 | G5 | 294，全部严格匹配 |
+| OCC 图像 neck、BEV CustomResNet/FPN_LSS、final_conv | G5 | 106，按语义映射并逐项检查形状 |
+| OCC 深度/context 卷积 | G5 | 2，取对应44个深度bin及完整64个context通道 |
+| 检测 head（不含anchor和初始instance feature） | SparseDrive stage1 | 477 |
+| 检测 FPN 输出卷积 | SparseDrive stage1 | 8 |
+| 辅助深度分支 | SparseDrive stage1 | 6 |
 
-在租赁机上将代码和以下数据放在项目目录：
+合计893个张量，41,360,968 / 41,908,542个参数（98.69%）来自预训练；此计数包含非训练参数，不是精度提升比例。剩余14个张量保持本架构初始化：检测FPN输入lateral的4组weight/bias、450个anchor和初始instance feature、OCC预测器的两组Linear weight/bias。即使bias形状匹配，也不脱离不兼容的所属层单独迁移。
 
-```text
-data/nuscenes/                 # 可软链接到实际磁盘
-  samples/ sweeps/ maps/ v1.0-trainval/
-  gts/scene-xxxx/<sample-token>/labels.npz
-data/infos/nuscenes_infos_train.pkl
-data/infos/nuscenes_infos_val.pkl
-data/kmeans/kmeans_det_900.npy
+G5深度配置为 `[1,60,1]`（59个depth+64个context），当前为 `[1,45,1]`（44+64）；转换选择源行 `[0:44]` 和 `[59:123]`，不是简单截前108行。softmax会在新的44个bin上重新归一化，属于迁移初始化，不是源深度分布的完全等价推理。OCC预测MLP原为128→256→288，现为128→128→288，不任意截取隐藏通道。
+
+生成脚本：
+
+```bash
+PYTHONPATH=. python tools/prepare_ep1_weights.py \
+  --g5 /path/to/BEVDet/ckpt/g5.pth \
+  --stage1 ckpt/sparsedrive_stage1.pth
 ```
 
-`infos` 使用本仓库的数据生成格式，而不是 BEVDet/FlashOCC 的 `bevdetv*-nuscenes_infos_*.pkl`。图像和 lidar 路径从 infos 中读取，迁移后需保证这些路径有效。`data/`、`ckpt/` 和 `work_dirs*/` 被 Git 忽略，git clone 不会带上数据/权重。
+默认输出 `ckpt/s1_det_occ_init.pth`（约161MB）及 `ckpt/s1_det_occ_init.report.json`。报告逐层记录来源、源/目标形状、转换方式、保留初始化的理由、源文件SHA256及参数覆盖率。源缺失、意外尺寸不一致或没有明确迁移策略的目标层会报错；检测类别顺序也会检查。生成使用seed=0，可通过 `--seed` 修改。
 
-当前验证环境：Python 3.8.20、torch 1.13.0+cu116、torchvision 0.14.0+cu116、mmcv-full 1.7.1、mmdet 2.28.2、numpy 1.23.5。新服务器先安装匹配的 torch/torchvision，再运行：
+`--source-depth-grid` 默认1 60 1，对应本次已核对的G5配置；换用其他来源必须明确检查其深度定义。G5/D1的骨干都兼容，但本次组合工具按G5的单帧结构映射，不支持将D1完整分支混入。
+
+导入的骨干和BEV编码器保留G5折叠BN的running statistics（各自norm_eval=True），卷积和BN affine仍训练。这个策略不会冻结检测LayerNorm，也不会冻结OCC预测MLP。G5的BEV物理范围/分辨率与当前不同，迁移后仍需微调，不能视为源模型的精度复现。
+
+原 `tools/prepare_ep1_backbone.py` 保留作单独骨干检查工具，不是默认训练初始化入口。正式推理/导出应加载训练后的完整S1 checkpoint；不使用原SparseDrive stage1作为完整模型恢复文件。
+
+## 数据与坐标
+
+检测使用 lidar 坐标，OCC 使用关键帧 ego 坐标。保留 `occ_ego2lidar` 和增强后的 `lidar2img`，得到 `occ_img2ego`；该适配接口没有照搬 SDK 数据加载器，但几何含义相同。
+
+使用本仓库 SparseDrive 格式的 `data/infos/nuscenes_infos_{train,val}.pkl`，以及 `data/nuscenes/gts/scene-xxxx/<sample-token>/labels.npz`。200×200×16 的 Occ3D 标签在 x/y 上中心裁剪 `[36:164]`，不插值类别标签。预裁剪数据需同步调整 `occ_source_grid`。
+
+保持原配置 `rot3d_range=[0,0]`；检测的55m过滤与 OCC 的±25.6m范围相互独立。其他图像增强和投影关系保留。
+
+## 四卡训练与迁移
+
+默认4 GPU，每卡batch4，总batch16，AdamW lr=1e-4，100个等效epoch（每epoch1758 iteration）。保留当前每卡2 worker、每10epoch评估/保存、保留3份checkpoint的工程设置。新增 OCC 的实际四卡容量和吞吐需在租赁机验证。
+
+环境为 Python3.8.20、torch1.13.0+cu116、torchvision0.14.0+cu116、mmcv-full1.7.1、mmdet2.28.2、flash-attn2.3.2。
 
 ```bash
 conda activate sparsedrive
 cd /path/to/SparseDrive
 python -m pip install -r requirement.txt
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+(cd projects/mmdet3d_plugin/ops && python setup.py build_ext --inplace)
 python tools/prepare_ep1_anchors.py
 bash scripts/train_ep1_s1.sh
 ```
 
-本配置的特征采样仍使用 `use_deformable_func=False`，不要求编译 `projects/mmdet3d_plugin/ops`。检测注意力已恢复原来的 `MultiheadFlashAttention`，训练和普通 GPU 推理需要 flash-attn 2.3.2；`requirement.txt` 已加入对应 Python 3.8 / torch 1.13 / CUDA 11.6 的 wheel。
+同一条 build_ext 命令现在同时编译检测聚合和 BEVPoolv2。需要与 torch 匹配的 CUDA toolkit、兼容的 C++ 编译器；例如 CUDA11.6 环境可使用 gcc/g++11。当前3090机已在 sparsedrive 环境中编译并验证。
 
-导出不训练第二套注意力。`forward_export` 在调用期间将原 FlashMHA 切到标准 MatMul/Softmax，再恢复原内核；权重沿用原 `attn.in_proj_weight/bias` 和 `attn.out_proj.*`。FP16 Flash 内核与 FP32 导出路径存在正常的舍入差异，自注意力和历史交叉注意力均有输出/梯度对比测试。之前 EP1 的独立 `q_proj/k_proj/v_proj` checkpoint 会在加载时拼接为原打包 QKV 权重；旧 `out_proj` 同时迁移，支持严格加载。
+迁移到租赁机时，`git clone` 不会带上被忽略的权重、数据和二进制：必须额外复制 `ckpt/s1_det_occ_init.pth`、anchor文件和训练数据（迁移报告建议一并保存），在目标机器重新编译两个算子。正常训练无需原G5/SparseDrive源checkpoint、BEVDet项目目录或SDK安装目录；只有重新生成组合初始化时才需要两个源checkpoint。无需依赖SDK安装目录；SDK 所需网络和算子源码已经包含在本项目内。
 
-默认 `pretrained=None`，可完全离线构建，但从头训练。建议正式训练前准备匹配的 no-SE 骨干预训练权重，并在配置中填写 `model.img_backbone.pretrained`。也支持 torchvision B0 初始化匹配层，SE/classifier 参数会被忽略；这只是初始化，不是指南里的已训练 no-SE 权重。官方 ResNet50 stage1/stage2 checkpoint 与本模型不兼容，不能作为完整模型直接恢复。
-
-`prepare_ep1_anchors.py` 对全部 900 个原始中心重新聚为 450 个，避免简单截断前 450 个导致空间分布偏置。该文件是初始化；若重新生成自己的数据，建议直接在训练集 GT 上重新做 450 类聚类。工具会保留已存在的 450 文件。
-
-恢复训练：
+恢复训练使用本架构的 checkpoint：
 
 ```bash
-bash scripts/train_ep1_s1.sh --resume-from work_dirs/ep1/s1_det_occ_b0_nose/iter_XXXX.pth
+bash scripts/train_ep1_s1.sh --resume-from /path/to/ep1_checkpoint.pth
 ```
 
-如果改 batch/GPU 数，需同步修改配置顶部 `num_gpus`、`batch_size`、优化器 lr，并重算迭代/验证间隔；仅通过 `--cfg-options data.samples_per_gpu=...` 不会自动重算顶部变量。若显存和数据吞吐允许，下一步可试每卡 8（总 32，lr 2e-4），需实测后决定。
+## 首帧、历史帧与导出
 
-## 一个 ONNX 处理首帧和历史帧
+首帧仍补齐300个历史槽位，但无有效历史时，temp_gnn 恢复原 SparseDrive 的当前帧自注意力；有历史时使用历史交叉注意力。保留场景切换、dt>0、最大间隔2秒的有效性检查。普通 GPU 模式在整个batch均有效/均无效时只计算对应一路；混合batch计算两路后按样本选择。
+
+同一个 ONNX 使用显式历史输入/输出。导出时通过张量选择两种注意力结果，不导出两个首帧/历史模型；目前可能多算一路，后续再优化。训练与导出都遵循相同首帧语义。
+
+现有 `forward_export` 的标准算子路线暂时保留：FlashAttention 转共享权重的 MatMul/Softmax，检测 CUDA 聚合转 GridSample，OCC pooling 保留 ScatterElements/add 参考实现。**网络结构已对齐 SDK，但导出的 pooling 图尚未替换为厂商 ONNX 的固定索引 Gather/CumSum/ScatterND 路线，也未实现 NPU 自定义算子。**
+
+检测 FPN 的 nearest Resize 保留原坐标规则；只有 OCC 的 linear Resize 写为 `pytorch_half_pixel`。PyTorch 对应 bilinear、align_corners=False；当前输出空间维均大于1，half_pixel 与 pytorch_half_pixel 数值等价。该坐标模式本身不是 nearest/bilinear 的性能比较结论。
 
 ```bash
-python -m pip install 'numpy<1.24' onnx==1.14.1 onnxruntime==1.14.1
 PYTHONPATH=. python tools/export_ep1_onnx.py \
-  projects/configs/ep1/s1_det_occ_b0_nose.py \
-  --checkpoint /path/to/your/ep1-checkpoint.pth
+  projects/configs/ep1/s1_det_occ_b0_nose.py --checkpoint /path/to/ep1_checkpoint.pth
 ```
 
-仅验证图结构时用 `--random-init` 替代 `--checkpoint`，生成的文件没有训练效果。不要将这份随机权重 ONNX 用作有效模型。
+输入/输出定义见 `tools/ep1_common.py`。历史特征 `[1,300,256]`、框 `[1,300,11]`、置信度 `[1,300]`，首帧补0并设置history_valid=False；后续回传输出状态和正确时间/位姿变换。框解码/筛选在图外。
 
-固定 batch 1 / 6 cameras / 256×704 / 450 queries / 300 history 的 ONNX，opset 16。输入：
-
-| 输入 | 形状/含义 |
-| --- | --- |
-| img | `[1,6,3,256,704]`，已按配置归一化的 RGB 图像 |
-| projection_mat | `[1,6,4,4]`，增强后的 lidar→image |
-| image_wh | `[1,6,2]`，每相机 `[704,256]` |
-| occ_img2ego | `[1,6,4,4]`，增强后 image ray→keyframe ego |
-| history_feature | `[1,300,256]` |
-| history_anchor | `[1,300,11]`，上一帧 lidar 下编码框 |
-| history_confidence | `[1,300]` |
-| history_transform | `[1,4,4]`，上一帧 lidar→当前帧 lidar |
-| time_interval | `[1]`，当前减上一帧时间，秒 |
-| history_valid | `[1]` bool，当前样本是否有合法历史 |
-
-首帧/新场景：history 三个张量补 0，transform 用单位矩阵，time_interval 可用 0.5，history_valid=False。后续将 `next_history_feature/anchor/confidence` 回传，提供实际变换/时间，history_valid=True。模型内部还会拒绝 dt≤0 或超过 2 秒的历史。无效 history 同时屏蔽缓存替换及 temporal attention 残差，避免“补零但 attention bias 仍影响首帧”。普通 PyTorch 模式也检查 scene_token，支持同一个 batch 中部分样本切换场景。
-
-ONNX 输出依次为 raw det logits `[1,450,10]`、encoded boxes `[1,450,11]`、quality `[1,450,2]`、occ logits `[1,128,128,16,18]` 和三个 next_history 张量。框解码/top-k 阈值/类别解码在图外，OCC logits 最后一维 argmax 得到类别。框编码沿用原项目 `[x,y,z,log(w),log(l),log(h),sin(yaw),cos(yaw),vx,vy,vz]`。
-
-PyTorch 中所有相关 bilinear resize 都是 align_corners=False；旧版导出器通常写 half_pixel，导出脚本会将本图（所有 resize 输出空间维度均大于 1）的模式写为 `pytorch_half_pixel`，两者在这里数值等价，再用 ORT 实测验证，而非仅依赖参数名。
-
-当前 ONNX 是完整、标准算子的参考图，包含 GridSample 和 ScatterElements/add（LSS pooling），没有 FlashAttention/自定义 DAF/按帧分支的 If。它已能在 ORT 上执行，但不等于已通过 LQ560 NPU 编译。NPU 工具链对 pooling、ScatterElements/add、注意力矩阵形状及量化的支持仍需板端验证；可优先用固定标定预计算 pooling 索引，并适配厂商 BEVPool/自定义算子。相机标定或图像增强变化时，索引不能直接复用。
-
-OCC 的 scatter_add 在 CUDA 有浮点加法顺序差异，所以测试对 OCC logits 使用小容差；检测状态一致性测试不依赖这部分随机顺序。FP32 对齐 ORT 时关闭 TF32，避免细小卷积误差使相近置信度的 top-k 缓存交换顺序。
-
-## 验证与后续压缩
+## 验证
 
 ```bash
-PYTHONPATH=. python -m unittest discover -s tests -p test_ep1.py -v
-PYTHONPATH=. python -m unittest discover -s tests -p test_ep1_attention.py -v
+PYTHONPATH=. OMP_NUM_THREADS=2 python -m unittest discover -s tests -p 'test_ep1*.py' -v
 ```
 
-短验证覆盖真实图像/检测/OCC 标签的前后向梯度、无效缓存隔离、正常历史影响、超时重置，以及标签中心裁剪、ego-motion、混合 batch 场景重置、LSS 累加/坐标轴/梯度、空可见掩码和替换 box block 的数学等价性。ONNX 脚本对同一个文件验证首帧、历史帧（包含非单位 ego-motion）和新场景重置。
+16项测试通过，包括严格骨干迁移、BN统计保持、四级输出、BEVPoolv2与参考实现的输出及输入/权重梯度、空池化、首帧/历史帧/混合batch与原注意力语义对比，以及原有采样/几何测试。G5 初始化的骨干与 SDK 原始骨干执行结果逐位一致；移植的三个 SDK 网络类经 AST 比较与原类主体一致。
 
-默认模型参数量 40,533,182；原 stage1（检测+map，ResNet50）为 75,675,882，任务组合不同，不能将参数比当作同任务速度比。本模型检测 head 21,182,895、OCC 分支 12,297,484，是下一步压缩重点。
+当前总参数41,908,542。真实数据连续两帧前向/反向通过，配置中的FP16 loss_scale=32反向也通过，每步调用6次检测CUDA聚合、10次FlashAttention和1次BEVPoolv2，历史有效标志由False转True。没有进行完整训练或四卡容量验证，也没有 LQ560 编译、量化和板端测速结果。
 
-恢复 FlashAttention 后在 3090 的单样本验证：真实训练数据两步反向传播通过，8 项回归测试通过，包括原 Flash 内核调用、共享权重输出/梯度比较、旧权重加载和导出后内核恢复。随机权重 ONNX 的首帧/历史帧/新场景 ORT 最大绝对误差约 2.51e-4，6 个 Resize 均为 pytorch_half_pixel；这不代表训练后精度或 LQ560 板端性能，尚未进行长训和 NPU 编译。
+统一 ONNX 的首帧、历史帧及场景重置均通过 ORT 对比（rtol/atol均3e-3，缓存按框/特征/置信度共同对应后比较）。接近置信度的 TopK 排序可因浮点误差交换；校验只对齐缓存行，不修改模型输出，也不独立重排特征。导出图没有 If，3个检测nearest Resize保持原规则，3个OCC linear Resize为pytorch_half_pixel。该测试使用未训练检测/OCC头，仅验证导出计算。
 
-建议按以下顺序做消融，每次都看检测 mAP/NDS、小目标召回、OCC mIoU（17 个非 free-space 类）以及目标板延迟：
-
-1. 将检测 embed_dims 256→128，联动 FPN、anchor encoder、attention、FFN、refine。attention score 矩阵大小不随通道变，但 QKV/FFN 参数量和计算量会明显下降。不能只改 FPN 输出通道。
-2. 解码器 6→3/4 层，或者浅层候选过滤。前者有直接延迟收益，后者可能引入动态 shape，需同时设计导出接口。默认先保留 6 层，减少同时改动导致的精度归因困难。
-3. OCC BEV encoder 的 128/256/512→128/128/128，neck 已经是 128，但 encoder 本身仍占较多参数。该项需要单独验证 OCC 精度。
-4. 检测减少 stride-4 大特征图或采样点（13→7），并同步更改 DenseDepth 与训练 gt_depth；重点检查远处小目标和行人的召回。
-5. INT8/QAT、Conv-BN 融合、固定标定的投影/池化索引预计算。优先 profile 真正的板端算子，尤其 GridSample、pooling、attention/softmax，不以参数量代替板端测速。
+组合初始化另外验证了893个迁移张量与对应源权重/转换结果逐项一致，450个anchor保持当前文件初始化；真实连续两帧FP16反向传播通过，192个导入BN状态张量保持不变。权重迁移不改变ONNX计算结构，尚无本次初始化后的完整训练精度结果。
