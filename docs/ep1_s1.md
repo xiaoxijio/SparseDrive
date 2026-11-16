@@ -112,10 +112,12 @@ PYTHONPATH=. python tools/export_ep1_onnx.py \
 PYTHONPATH=. OMP_NUM_THREADS=2 python -m unittest discover -s tests -p 'test_ep1*.py' -v
 ```
 
-16项测试通过，包括严格骨干迁移、BN统计保持、四级输出、BEVPoolv2与参考实现的输出及输入/权重梯度、空池化、首帧/历史帧/混合batch与原注意力语义对比，以及原有采样/几何测试。G5 初始化的骨干与 SDK 原始骨干执行结果逐位一致；移植的三个 SDK 网络类经 AST 比较与原类主体一致。
+21项测试通过，包括严格骨干迁移、BN统计保持、四级输出、BEVPoolv2与参考实现的输出及输入/权重梯度、空池化、首帧/历史帧/混合batch与原注意力语义对比，以及原有采样/几何测试。G5 初始化的骨干与 SDK 原始骨干执行结果逐位一致；移植的三个 SDK 网络类经 AST 比较与原类主体一致。
 
 当前总参数41,908,542。真实数据连续两帧前向/反向通过，配置中的FP16 loss_scale=32反向也通过，每步调用6次检测CUDA聚合、10次FlashAttention和1次BEVPoolv2，历史有效标志由False转True。没有进行完整训练或四卡容量验证，也没有 LQ560 编译、量化和板端测速结果。
 
 统一 ONNX 的首帧、历史帧及场景重置均通过 ORT 对比（rtol/atol均3e-3，缓存按框/特征/置信度共同对应后比较）。接近置信度的 TopK 排序可因浮点误差交换；校验只对齐缓存行，不修改模型输出，也不独立重排特征。导出图没有 If，3个检测nearest Resize保持原规则，3个OCC linear Resize为pytorch_half_pixel。该测试使用未训练检测/OCC头，仅验证导出计算。
 
 组合初始化另外验证了893个迁移张量与对应源权重/转换结果逐项一致，450个anchor保持当前文件初始化；真实连续两帧FP16反向传播通过，192个导入BN状态张量保持不变。权重迁移不改变ONNX计算结构，尚无本次初始化后的完整训练精度结果。
+
+固定标定NPU导出另见 [部署适配说明](ep1_s1_npu_deployment.md)，入口为 tools/export_ep1_npu.py。此适配不改变训练模型；原tools/export_ep1_onnx.py继续保留动态相机参数和logits参考接口。
