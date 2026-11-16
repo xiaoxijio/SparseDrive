@@ -7,6 +7,9 @@ plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
+# Fixed image shapes and one CPU thread per nested worker.
+cudnn_benchmark = True
+opencv_num_threads = 0
 work_dir = './work_dirs/ep1/s1_det_occ_b0_nose'
 load_from = 'ckpt/s1_det_occ_init.pth'
 resume_from = None
@@ -103,10 +106,12 @@ model = dict(
             decoder=dict(type='SparseBox3DDecoder', num_output=300),
             reg_weights=[2.0] * 3 + [1.0] * 7)))
 
-# Training target: 4 x 32-GB GPUs, 4 samples/GPU (global batch = 16).
+# Measured on 4 x 32-GB GPUs: 16 samples/GPU, global batch 64.
+# Retain backbone checkpointing: similar throughput to batch12/no-checkpoint,
+# with more VRAM headroom. CPU/BLAS limits are set in train_ep1_s1.sh.
 # The 3090 host is used only for single-sample smoke tests.
 num_gpus = 4
-batch_size = 4
+batch_size = 16
 num_epochs = 100
 num_iters_per_epoch = 28130 // (num_gpus * batch_size)
 checkpoint_epoch_interval = 10
@@ -153,7 +158,7 @@ data_basic_config = dict(
     modality=dict(use_lidar=False, use_camera=True, use_radar=False,
                   use_map=False, use_external=False), version='v1.0-trainval')
 data = dict(
-    samples_per_gpu=batch_size, workers_per_gpu=2,
+    samples_per_gpu=batch_size, workers_per_gpu=8,
     train=dict(**data_basic_config, ann_file=anno_root + 'nuscenes_infos_train.pkl',
                pipeline=train_pipeline, test_mode=False, data_aug_conf=data_aug_conf,
                with_seq_flag=True, sequences_split_num=2, keep_consistent_seq_aug=True),
@@ -162,8 +167,8 @@ data = dict(
     test=dict(**data_basic_config, ann_file=anno_root + 'nuscenes_infos_val.pkl',
               pipeline=test_pipeline, test_mode=True, data_aug_conf=data_aug_conf))
 
-# Official global batch 64 uses 4e-4; linearly scale to global batch 16.
-optimizer = dict(type='AdamW', lr=1e-4, weight_decay=0.001,
+# Preserve the original linear LR scaling when changing global batch.
+optimizer = dict(type='AdamW', lr=4e-4 * (num_gpus * batch_size) / 64, weight_decay=0.001,
                  paramwise_cfg=dict(custom_keys={'img_backbone': dict(lr_mult=0.5)}))
 optimizer_config = dict(grad_clip=dict(max_norm=25, norm_type=2))
 lr_config = dict(policy='CosineAnnealing', warmup='linear', warmup_iters=500,

@@ -26,7 +26,7 @@ from datetime import timedelta
 
 import cv2
 
-cv2.setNumThreads(8)
+# Apply OpenCV threading after the configuration has been loaded.
 
 
 def parse_args():
@@ -133,6 +133,7 @@ def main():
     cfg = Config.fromfile(args.config)
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
+    cv2.setNumThreads(cfg.get("opencv_num_threads", 8))
     # import modules from string list.
     if cfg.get("custom_imports", None):
         from mmcv.utils import import_modules_from_strings

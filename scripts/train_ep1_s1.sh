@@ -2,7 +2,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export PYTHONPATH="$(pwd)${PYTHONPATH:+:$PYTHONPATH}"
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+# Bound each process: rental shells may otherwise inherit 48 BLAS threads.
+export OMP_NUM_THREADS="${SPARSEDRIVE_OMP_THREADS:-1}"
+export MKL_NUM_THREADS="${SPARSEDRIVE_MKL_THREADS:-1}"
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
 # Activate sparsedrive before calling this script. Override PORT if occupied.
 CONFIG=projects/configs/ep1/s1_det_occ_b0_nose.py
 python tools/prepare_ep1_anchors.py
