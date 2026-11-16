@@ -14,7 +14,8 @@ work_dir = './work_dirs/ep1/s1_det_occ_b0_nose'
 load_from = 'ckpt/s1_det_occ_init.pth'
 resume_from = None
 workflow = [('train', 1)]
-fp16 = dict(loss_scale=32.0)
+# Adapt AMP scale on overflow; this does not replace conservative LR.
+fp16 = dict(loss_scale=dict(init_scale=32.0, growth_interval=2000))
 
 class_names = ['car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
                'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
@@ -114,7 +115,8 @@ num_gpus = 4
 batch_size = 16
 num_epochs = 100
 num_iters_per_epoch = 28130 // (num_gpus * batch_size)
-checkpoint_epoch_interval = 10
+checkpoint_epoch_interval = 1
+evaluation_epoch_interval = 10
 checkpoint_config = dict(interval=num_iters_per_epoch * checkpoint_epoch_interval,
                          max_keep_ckpts=3)
 log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook', by_epoch=False)])
@@ -167,14 +169,15 @@ data = dict(
     test=dict(**data_basic_config, ann_file=anno_root + 'nuscenes_infos_val.pkl',
               pipeline=test_pipeline, test_mode=True, data_aug_conf=data_aug_conf))
 
-# Preserve the original linear LR scaling when changing global batch.
-optimizer = dict(type='AdamW', lr=4e-4 * (num_gpus * batch_size) / 64, weight_decay=0.001,
+# Conservative LR for fine-tuning combined pretrained weights and new layers.
+# Keep batch 64 for throughput; do not automatically multiply this LR by batch.
+optimizer = dict(type='AdamW', lr=1e-4, weight_decay=0.001,
                  paramwise_cfg=dict(custom_keys={'img_backbone': dict(lr_mult=0.5)}))
 optimizer_config = dict(grad_clip=dict(max_norm=25, norm_type=2))
-lr_config = dict(policy='CosineAnnealing', warmup='linear', warmup_iters=500,
+lr_config = dict(policy='CosineAnnealing', warmup='linear', warmup_iters=1000,
                  warmup_ratio=1. / 3, min_lr_ratio=1e-3)
 runner = dict(type='IterBasedRunner', max_iters=num_iters_per_epoch * num_epochs)
 eval_mode = dict(with_det=True, with_tracking=False, with_map=False, with_motion=False,
                  with_planning=False, with_occ=True, tracking_threshold=0.2,
                  motion_threshhold=0.2)
-evaluation = dict(interval=num_iters_per_epoch * checkpoint_epoch_interval, eval_mode=eval_mode)
+evaluation = dict(interval=num_iters_per_epoch * evaluation_epoch_interval, eval_mode=eval_mode)
