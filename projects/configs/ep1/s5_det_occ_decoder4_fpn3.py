@@ -4,7 +4,14 @@ Small/far objects may lose accuracy; train and evaluate separately.
 """
 _base_ = './s2_det_occ_decoder4.py'
 work_dir = './work_dirs/ep1/s5_det_occ_decoder4_fpn3'
-load_from = 'ckpt/s5_det_occ_decoder4_fpn3_init.pth'
+# Prepared from the completed S2 iter_8780 checkpoint, with scale-aware FPN mapping.
+load_from = 'ckpt/s5_from_s2_final_init.pth'
+resume_from = None
+# Retain conservative fine-tuning LR: changed sampling projections need adaptation.
+optimizer = dict(lr=2e-5)
+lr_config = dict(warmup_iters=500)
+num_epochs = 20
+runner = dict(max_iters=439 * num_epochs)
 strides = [8, 16, 32]
 model = dict(img_neck=dict(start_level=1, num_outs=3),
              head=dict(det_head=dict(deformable_model=dict(num_levels=3))))
