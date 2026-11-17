@@ -17,7 +17,24 @@ OUTPUT_NAMES = ['det_logits', 'det_boxes', 'det_quality', 'occ_logits',
                 'next_history_feature', 'next_history_anchor', 'next_history_confidence']
 
 
-def load_model(config_path, checkpoint=None, device='cuda:0'):
+def load_export_checkpoint(model, checkpoint):
+    """Load a local training checkpoint; discard only the regenerated frustum."""
+    saved = torch.load(checkpoint, map_location='cpu')
+    state = saved.get('state_dict', saved).copy()
+    if state and all(key.startswith('module.') for key in state):
+        from collections import OrderedDict
+        state = OrderedDict((key[7:], value) for key, value in state.items())
+    key = 'occ_branch.view_transform.frustum'
+    # This adapter expects frustum to be a nonpersistent, regenerated buffer.
+    if key in model.state_dict():
+        raise RuntimeError('Expected a nonpersistent frustum in the export model')
+    removed = state.pop(key, None) is not None
+    model.load_state_dict(state, strict=True)
+    print('Export checkpoint loaded strictly; regenerated frustum removed:', removed,
+          flush=True)
+
+
+def load_model(config_path, checkpoint=None, device='cuda:0', export_checkpoint=False):
     get_logger('mmcv', log_level=logging.WARNING)
     logging.disable(logging.INFO)
     # CPU ONNX Runtime uses full FP32. TF32 convolution errors can reorder
@@ -33,7 +50,10 @@ def load_model(config_path, checkpoint=None, device='cuda:0'):
     if initialization:
         # A combined S1 initialization and a trained S1 checkpoint both contain
         # the complete architecture. Never partially accept an old stage1 model.
-        load_checkpoint(model, initialization, map_location='cpu', strict=True)
+        if export_checkpoint:
+            load_export_checkpoint(model, initialization)
+        else:
+            load_checkpoint(model, initialization, map_location='cpu', strict=True)
     model.to(device)
     return cfg, model
 

@@ -93,18 +93,19 @@ bash scripts/train_ep1_s1.sh --resume-from /path/to/ep1_checkpoint.pth
 
 首帧仍补齐300个历史槽位，但无有效历史时，temp_gnn 恢复原 SparseDrive 的当前帧自注意力；有历史时使用历史交叉注意力。保留场景切换、dt>0、最大间隔2秒的有效性检查。普通 GPU 模式在整个batch均有效/均无效时只计算对应一路；混合batch计算两路后按样本选择。
 
-同一个 ONNX 使用显式历史输入/输出。导出时通过张量选择两种注意力结果，不导出两个首帧/历史模型；目前可能多算一路，后续再优化。训练与导出都遵循相同首帧语义。
+同一个 ONNX 使用显式历史输入/输出。当前 NPU 适配器通过张量选择注意力 K/V 后执行一路 attention，不导出两个首帧/历史模型。训练与导出都遵循相同首帧语义。
 
-现有 `forward_export` 的标准算子路线暂时保留：FlashAttention 转共享权重的 MatMul/Softmax，检测 CUDA 聚合转 GridSample，OCC pooling 保留 ScatterElements/add 参考实现。**网络结构已对齐 SDK，但导出的 pooling 图尚未替换为厂商 ONNX 的固定索引 Gather/CumSum/ScatterND 路线，也未实现 NPU 自定义算子。**
+现有 `forward_export` 的标准算子路线暂时保留：FlashAttention 转共享权重的 MatMul/Softmax，检测 CUDA 聚合转 GridSample，OCC pooling 保留 ScatterElements/add 参考实现。这是源模型参考路径；当前 NPU 导出使用 FixedRigDeployment 的固定几何 Gather/ReduceSum/ScatterND 适配，详见部署适配说明。
 
 检测 FPN 的 nearest Resize 保留原坐标规则；只有 OCC 的 linear Resize 写为 `pytorch_half_pixel`。PyTorch 对应 bilinear、align_corners=False；当前输出空间维均大于1，half_pixel 与 pytorch_half_pixel 数值等价。该坐标模式本身不是 nearest/bilinear 的性能比较结论。
 
 ```bash
-PYTHONPATH=. python tools/export_ep1_onnx.py \
-  projects/configs/ep1/s1_det_occ_b0_nose.py --checkpoint /path/to/ep1_checkpoint.pth
+PYTHONPATH=. python tools/export_ep1_npu.py \
+  --config projects/configs/ep1/s1_det_occ_b0_nose.py \
+  --checkpoint /path/to/ep1_checkpoint.pth
 ```
 
-输入/输出定义见 `tools/ep1_common.py`。历史特征 `[1,300,256]`、框 `[1,300,11]`、置信度 `[1,300]`，首帧补0并设置history_valid=False；后续回传输出状态和正确时间/位姿变换。框解码/筛选在图外。
+NPU 输入/输出定义见 `projects/mmdet3d_plugin/models/ep1/deployment.py`。历史特征 `[1,300,256]`、框 `[1,300,11]`、置信度 `[1,300]`，首帧补0并设置history_valid=False；后续回传输出状态和正确时间/位姿变换。框解码/筛选在图外。
 
 ## 验证
 
@@ -120,4 +121,6 @@ PYTHONPATH=. OMP_NUM_THREADS=2 python -m unittest discover -s tests -p 'test_ep1
 
 组合初始化另外验证了893个迁移张量与对应源权重/转换结果逐项一致，450个anchor保持当前文件初始化；真实连续两帧FP16反向传播通过，192个导入BN状态张量保持不变。权重迁移不改变ONNX计算结构，尚无本次初始化后的完整训练精度结果。
 
-固定标定NPU导出另见 [部署适配说明](ep1_s1_npu_deployment.md)，入口为 tools/export_ep1_npu.py。此适配不改变训练模型；原tools/export_ep1_onnx.py继续保留动态相机参数和logits参考接口。
+固定标定NPU导出另见 [部署适配说明](ep1_s1_npu_deployment.md)，入口为 tools/export_ep1_npu.py。此适配不改变训练模型；通用导出脚本已移除；NPU 导出直接接受训练 PTH，在内存中忽略可重建 frustum，并严格加载所有学习参数，无需生成中间 PTH。
+
+导出默认运行 onnxsim 图简化，无需传 --simplify；排查问题时可用 --no-simplify 关闭。简化后仍执行 ONNX 检查和原有首帧/历史帧/重置数值验证，不保证速度提升，也不替代编译端兼容处理。

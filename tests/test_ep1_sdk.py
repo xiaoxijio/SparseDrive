@@ -42,9 +42,36 @@ class SDKChecks(unittest.TestCase):
         with self.assertRaises(ValueError):
             extract_backbone(dict(state_dict=bad), source.state_dict())
 
+    def test_export_checkpoint_ignores_only_regenerated_frustum(self):
+        from tools.ep1_common import load_export_checkpoint
+        model = nn.Linear(3, 2)
+        expected = {k: v.clone() for k, v in model.state_dict().items()}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'trained.pth'
+            for prefixed in (False, True):
+                state = dict(expected)
+                state['occ_branch.view_transform.frustum'] = torch.ones(2, 3)
+                if prefixed:
+                    state = {'module.' + k: v for k, v in state.items()}
+                torch.save(dict(state_dict=state, optimizer={'unused': 1}), path)
+                before = path.read_bytes()
+                target = nn.Linear(3, 2)
+                load_export_checkpoint(target, str(path))
+                self.assertEqual(path.read_bytes(), before)
+                for key, value in expected.items():
+                    torch.testing.assert_close(target.state_dict()[key], value, rtol=0, atol=0)
+            for bad in ({'weight': expected['weight']},
+                        dict(expected, weight=torch.zeros(1)),
+                        dict(expected, unexpected=torch.ones(1))):
+                torch.save(dict(state_dict=bad), path)
+                with self.assertRaises(RuntimeError):
+                    load_export_checkpoint(nn.Linear(3, 2), str(path))
+            torch.save(expected, path)
+            load_export_checkpoint(nn.Linear(3, 2), str(path))
+
     def test_export_comparison_preserves_joint_cache_correspondence(self):
         import numpy as np
-        from tools.export_ep1_onnx import align_cache_rows
+        from tools.export_ep1_npu import align_cache_rows
         rng = np.random.RandomState(3)
         expected = [np.zeros(1) for _ in range(4)] + [
             rng.randn(1, 3, 4), rng.randn(1, 3, 11), rng.rand(1, 3)]
