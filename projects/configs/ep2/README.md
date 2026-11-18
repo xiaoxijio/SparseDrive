@@ -75,3 +75,15 @@ Q1/Q2均保持LR1e-5、不按batch放大。每轮586步、6轮3516步；observer
 PYTHONPATH=. python tools/val_ep.py ckpt/q1.pth --config projects/configs/ep2/q1.py --output val/q1_pth
 ```
 已通过实际q1 checkpoint的两帧CUDA检查，未运行全量验证。普通PTH、ONNX入口保留。SDK模块结构用临时合成张量建立，随后全部量化状态被训练checkpoint严格覆盖；不会利用验证集更新训练标尺。
+
+## Q3：S5 的独立 QAT 版本
+
+配置 `q3.py` 直接继承 EP1 S5，`load_from=ckpt/s5.pth`（训练完成的S5），不做分支组合、不重新初始化任何结构层。保留4轮decoder、FFN1024、3层FPN，以及原大OCC编码器[128,256,512]。因此不继承S4小OCC编码器及其新BN统计量问题。
+采用与q1/q2相同的官方SDK 2.1.6 Conv2d混合精度QAT，主网络/伪量化FP32，FlashAttention局部FP16；大OCC编码器的已训练BN仍冻结。
+默认用于四张32GB GPU：每卡batch8、每轮879步、6轮5274步，LR1e-5（backbone5e-6），warmup250步，observer在879步冻结，每轮保存、最近3份。增大OCC主干后未沿用q1/q2的batch12，四卡长期显存/吞吐尚未测试。
+3090单卡只做一批样本的检查；通用训练脚本仍启动4卡，不要在单卡3090上直接按四卡命令启动。
+四卡服务器准备相同S5 checkpoint和配置后：
+```bash
+bash scripts/train_ep1.sh projects/configs/ep2/q3.py
+```
+训练后应对比原S5浮点权重的mIoU/mAP，不能仅凭loss推断QAT精度保留。
