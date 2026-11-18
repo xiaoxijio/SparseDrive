@@ -1,30 +1,56 @@
 """Export a fixed-rig S1 graph, retaining dynamic history pose and time."""
 import argparse
 import json
+import warnings
+import sys
+
+# This notice concerns a future MMCV release, not this pinned environment.
+warnings.filterwarnings("ignore", message=r"On January 1, 2023, MMCV will release.*", category=UserWarning)
 from pathlib import Path
 import numpy as np
 import torch
 from mmdet.datasets import build_dataset
 from tools.ep1_common import load_model, sample_to_device, make_export_inputs
-from tools.export_ep1_onnx import align_cache_rows
 from projects.mmdet3d_plugin.models.ep1.deployment import (
     FixedRigDeployment, INPUT_NAMES, OUTPUT_NAMES)
 
+def align_cache_rows(expected, actual):
+    """Compare jointly permuted TopK cache rows without changing model outputs.
+
+    Tiny backend rounding differences can exchange nearly tied confidence ranks.
+    Match encoded anchors one-to-one, then check features and confidence using
+    that SAME assignment. Different selected targets still fail allclose.
+    """
+    from scipy.optimize import linear_sum_assignment
+    aligned = list(actual[:4]) + [x.copy() for x in actual[4:]]
+    for batch in range(expected[5].shape[0]):
+        distance = np.linalg.norm(expected[5][batch, :, None] - actual[5][batch, None, :], axis=-1)
+        rows, columns = linear_sum_assignment(distance)
+        for index in (4, 5, 6):
+            aligned[index][batch, rows] = actual[index][batch, columns]
+    return aligned
 
 def main():
     import onnx
     import onnxruntime as ort
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default='projects/configs/ep1/s1_det_occ_b0_nose.py')
-    parser.add_argument('--checkpoint')
+    parser.add_argument('--checkpoint', default='ckpt/iter_43900.pth')
     parser.add_argument('--calibration', help='npz with projection_mat, image_wh, occ_img2ego')
     parser.add_argument('--sample-index', type=int, default=0)
-    parser.add_argument('--output', default='work_dirs/ep1/npu/s1_fixed.onnx')
+    parser.add_argument('--output', default='onnx/s1.onnx')
+    parser.add_argument('--verbose-warnings', action='store_true', help='Print each export warning as well as recording it')
     parser.add_argument('--check-only', action='store_true', help='Validate an existing ONNX without exporting again')
-    parser.add_argument('--simplify', action='store_true', help='Requires onnxsim; strongly recommended before OMG')
+    parser.add_argument('--no-simplify', dest='simplify', action='store_false',
+                        help='Disable default onnxsim simplification for debugging')
     args = parser.parse_args()
+    if args.simplify:
+        try:
+            from onnxsim import simplify
+        except ImportError:
+            parser.error('Default simplification requires onnxsim; install it with python -m pip install onnxsim, or use --no-simplify for debugging')
     torch.manual_seed(0); torch.set_num_threads(4)
-    cfg, model = load_model(args.config, args.checkpoint, device='cpu')
+    cfg, model = load_model(args.config, args.checkpoint, device='cpu', export_checkpoint=True)
     model.eval()
     dataset = build_dataset(cfg.data.val)
     data = sample_to_device(dataset, args.sample_index, device=-1)
@@ -54,10 +80,25 @@ def main():
                   host_validity_required=True, time_interval_dynamic=True,
                   npu_compilation_tested=False)
     if not args.check_only:
-        with torch.no_grad():
-            torch.onnx.export(wrapper, tuple(inputs), str(output), opset_version=16,
-                              input_names=INPUT_NAMES, output_names=OUTPUT_NAMES,
-                              do_constant_folding=True)
+        with warnings.catch_warnings(record=True) as captured:
+            warnings.simplefilter('always')
+            with torch.no_grad():
+                torch.onnx.export(wrapper, tuple(inputs), str(output), opset_version=16,
+                                  input_names=INPUT_NAMES, output_names=OUTPUT_NAMES,
+                                  do_constant_folding=True)
+        warning_rows = [dict(category=w.category.__name__, message=str(w.message),
+                             filename=w.filename, lineno=w.lineno) for w in captured]
+        warning_path = output.with_suffix('.warnings.json')
+        warning_path.write_text(json.dumps(warning_rows, indent=2)+'\n')
+        report['export_warnings'] = dict(count=len(warning_rows), path=str(warning_path))
+        if warning_rows:
+            print('Export produced {} warnings; full details: {}'.format(len(warning_rows), warning_path), flush=True)
+            for category in sorted(set(w['category'] for w in warning_rows)):
+                unique = list(dict.fromkeys(w['message'] for w in warning_rows if w['category'] == category))
+                print('  {}: {} distinct warning messages'.format(category,len(unique)), flush=True)
+            if args.verbose_warnings:
+                for w in captured:
+                    sys.stderr.write(warnings.formatwarning(w.message,w.category,w.filename,w.lineno))
     graph = onnx.load(str(output))
     for node in graph.graph.node:
         if node.op_type == 'Resize' and any(a.name == 'mode' and a.s == b'linear' for a in node.attribute):
@@ -65,7 +106,6 @@ def main():
                 if a.name == 'coordinate_transformation_mode' and a.s == b'half_pixel':
                     a.s = b'pytorch_half_pixel'
     if args.simplify:
-        from onnxsim import simplify
         graph, checked = simplify(graph)
         assert checked
     onnx.checker.check_model(graph)

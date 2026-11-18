@@ -2,7 +2,7 @@
 
 本次只新增推理/导出适配器，不改训练网络、损失、数据增强或checkpoint结构；无需重新生成组合初始化权重，也无需按部署adapter训练。普通训练和评测继续逐样本使用相机参数及真实时间/位姿。
 
-## 当前结果
+## 历史结果（2026-11-13，非当前权重验证结果）
 
 - 原版简化参考图：OMG检查1945项NPU支持、30项不支持。
 - 新版简化图：2702个ONNX节点，OMG 2.1.6 / LQ560ProV200优化后1810项全部标为NPU Supported，0 Unsupported；中间张量最高6维。
@@ -35,11 +35,13 @@ nuScenes标注关键帧为2Hz，但当前val infos中5869个同场景相邻间�
 
 代码：`projects/mmdet3d_plugin/models/ep1/deployment.py`；工具：`tools/export_ep1_npu.py`。
 
+直接传训练 PTH，无需中间权重文件。导出和校准共用 tools/ep1_common.py 中的兼容加载器，仅在内存中丢弃可重建 frustum；学习参数缺失、额外参数或形状不匹配仍严格报错。
+
 ```bash
-# onnxsim为导出用的可选依赖，不影响训练环境。
+# 默认图简化需要 onnxsim，不影响训练环境。
 python -m pip install onnxsim -i https://mirrors.aliyun.com/pypi/simple/
 PYTHONPATH=. python tools/export_ep1_npu.py \
-  --checkpoint /path/to/trained_s1.pth --simplify
+  --checkpoint /path/to/trained_s1.pth
 ```
 
 没有实车标定时默认提取nuScenes样本0并标记PREFLIGHT ONLY；可用`--sample-index`改变参考样本。提供标定时：
@@ -47,7 +49,7 @@ PYTHONPATH=. python tools/export_ep1_npu.py \
 ```bash
 PYTHONPATH=. python tools/export_ep1_npu.py \
   --checkpoint /path/to/trained_s1.pth \
-  --calibration /path/to/rig.calibration.npz --simplify
+  --calibration /path/to/rig.calibration.npz
 ```
 
 `--check-only`验证已存在文件，会使用同名保存标定，避免误用另一个样本。无--checkpoint时按配置加载组合初始化，只能用于结构预检，不能当作训练完成的模型。
@@ -67,3 +69,7 @@ ONNX已在本机工具环境简化后回传，SHA256：`b46e5571423878e11b4cbae5
 OMG配置只用于--check，不是量化标定配置；检查命令与原预检报告一致。该图尚有上述ORT数值检查失败，后续完整编译、量化和训练后精度验证需分别完成。
 
 当前对比是同输入、同历史状态的一步比较，并非独立长序列误差传播验证。后续还需要训练后权重的长序列、量化与板端精度评估。
+
+导出默认运行 onnxsim 图简化，无需传 --simplify；排查问题时可用 --no-simplify 关闭。简化后仍执行 ONNX 检查和原有首帧/历史帧/重置数值验证，不保证速度提升，也不替代编译端兼容处理。
+
+导出警告：固定版本 MMCV 的旧升级公告已过滤。torch.onnx.export 的 Python 警告保存在 ONNX 同名 .warnings.json，终端显示数量和分类；--verbose-warnings 可展开。TracerWarning 可能表示追踪固定了 Python 条件，当前部署固定形状，但仍需确认没有把 history_valid 固定；首帧/历史/重置数值校验保持启用。prim::Constant 形状推断、Slice 常量折叠警告不直接等于失败，仍检查最终 ONNX 和 ORT。此处理减少重复输出，不声称消除了警告背后的限制。C++/ORT 日志仍正常显示。
