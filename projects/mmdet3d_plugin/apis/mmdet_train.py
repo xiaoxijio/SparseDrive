@@ -89,6 +89,12 @@ def custom_train_detector(
         for ds in dataset
     ]
 
+    # QAT must rename/convert modules before DDP and optimizer construction.
+    # The floating-point EP1 path is unchanged when qat is absent.
+    if cfg.get('qat'):
+        from .ep2_qat import prepare_training
+        model = prepare_training(model, data_loaders[0], cfg, logger)
+
     # put model on gpus
     if distributed:
         find_unused_parameters = cfg.get("find_unused_parameters", False)
@@ -156,6 +162,10 @@ def custom_train_detector(
         cfg.log_config,
         cfg.get("momentum_config", None),
     )
+
+    if cfg.get('qat'):
+        from .ep2_qat import OritekQATHook
+        runner.register_hook(OritekQATHook(cfg.qat), priority='HIGH')
 
     # register profiler hook
     # trace_config = dict(type='tb_trace', dir_name='work_dir')
