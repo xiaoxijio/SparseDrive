@@ -22,8 +22,34 @@ class PthRunner:
         if args.device == 'cuda' and not cuda:
             raise RuntimeError('CUDA requested but unavailable')
         self.device = 0 if cuda else -1
-        self.cfg, self.model = load_model(args.config, args.model,
-            device='cuda:0' if cuda else 'cpu', export_checkpoint=True)
+        checkpoint = torch.load(args.model, map_location='cpu')
+        qat_meta = checkpoint.get('meta', {}).get('oritek_qat')
+        self.qat_meta = qat_meta
+        if qat_meta:
+            if not cuda:
+                raise RuntimeError('Native QAT validation requires CUDA/FlashAttention')
+            from mmcv import Config
+            from mmdet.models import build_detector
+            from projects.mmdet3d_plugin.apis.ep2_qat import restore_qat_for_eval
+            self.cfg = Config.fromfile(args.config)
+            import logging
+            old_level = logging.root.manager.disable
+            logging.disable(logging.INFO)
+            try:
+                self.model = build_detector(self.cfg.model)
+                self.model.init_weights()
+            finally:
+                logging.disable(old_level)
+            self.model = restore_qat_for_eval(self.model, checkpoint, self.cfg.qat).cuda()
+            # Moving to CUDA preserves trained buffers; observers stay frozen.
+            print('QAT checkpoint restored strictly: SDK', qat_meta['sdk_version'],
+                  'trained fake quant enabled; observers frozen', flush=True)
+        else:
+            if any('quantizer' in k for k in checkpoint.get('state_dict', checkpoint)):
+                raise RuntimeError('Quantized checkpoint lacks required QAT metadata')
+            self.cfg, self.model = load_model(args.config, args.model,
+                device='cuda:0' if cuda else 'cpu', export_checkpoint=True)
+        del checkpoint
         cfg = self.cfg.data.val.copy()
         cfg.data_root = args.data_root.rstrip('/') + '/'
         cfg.occ_root = cfg.data_root + 'gts'
@@ -38,8 +64,12 @@ class PthRunner:
     def infer(self, index):
         data = sample_to_device(self.dataset, index, self.device)
         started = time.perf_counter()
+        scales = {k:v.detach().clone() for k,v in self.model.state_dict().items()
+                  if self.qat_meta and k.endswith(('.scale','.zero_point'))} if index==0 else {}
         with torch.no_grad():
             pred = self.model(**data)[0]['img_bbox']
+        for k,v in scales.items():
+            torch.testing.assert_close(self.model.state_dict()[k], v, rtol=0, atol=0)
         pred = {k:(v.detach().cpu() if torch.is_tensor(v) else v) for k,v in pred.items()}
         self.seconds += time.perf_counter()-started
         self.frames += 1
@@ -48,13 +78,14 @@ class PthRunner:
     def provenance(self):
         return dict(scope='Native PTH inference with per-frame dataset calibration; no fixed-rig adapter.',
                     frames=self.frames, device=str(next(self.model.parameters()).device),
+                    qat=self.qat_meta, observers_frozen=bool(self.qat_meta),
                     inference_host_seconds=self.seconds)
 
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('model', help='ONNX model or PyTorch checkpoint; suffix selects backend')
-    p.add_argument('--config', required=True, help='Matching architecture config (S1/S2/S3/S4/S5)')
+    p.add_argument('--config', required=True, help='Matching architecture config (S1-S5 or Q1/Q2)')
     p.add_argument('--output', dest='out_dir', help='Default: val/<model stem>_<backend>')
     p.add_argument('--data-root', default='data/nuscenes')
     p.add_argument('--device', choices=['auto','cuda','cpu'], default='auto')

@@ -233,3 +233,47 @@ class OritekQATHook(Hook):
 
     def after_train_iter(self, runner):
         self._sync(runner.model.module, self.recipe.get('coalesced_sync', False))
+
+
+def restore_qat_for_eval(model, checkpoint, recipe):
+    """Rebuild SDK Conv islands and strictly restore trained quantization state.
+
+    Synthetic tensors only instantiate the SDK schema; every weight, observer
+    range, scale and zero point is overwritten by checkpoint state afterwards.
+    No validation image is used to recalibrate the trained model.
+    """
+    from importlib.metadata import version
+    validate_recipe(checkpoint, recipe)
+    saved_version = checkpoint['meta']['oritek_qat']['sdk_version']
+    if version('oritek-qat-pytorch') != saved_version:
+        raise RuntimeError('QAT SDK must match checkpoint version ' + saved_version)
+    q = qat_tool()
+    q.initialize()
+    paths = convolution_paths(model, recipe)
+    model.cpu().float()
+    for name in paths:
+        parent_name, _, leaf = name.rpartition('.')
+        parent = model.get_submodule(parent_name) if parent_name else model
+        original = parent._modules[leaf]
+        quant = q.create_quant_model(nn.Sequential(original), fuse_bn=False,
+                                     chip_type=recipe['chip_type'])
+        size = max(8, max(original.kernel_size) * max(original.dilation) + 1)
+        quant = q.optimize_and_initialize_model(
+            quant, torch.zeros(1, original.in_channels, size, size))
+        _persist_scales(quant)
+        parent._modules[leaf] = quant
+    model.occ_branch.view_transform._non_persistent_buffers_set.discard('frustum')
+    model.register_buffer('_qat_format_version', torch.tensor(FORMAT_VERSION))
+    state = checkpoint['state_dict']
+    if state and all(k.startswith('module.') for k in state):
+        state = {k[7:]: v for k,v in state.items()}
+    model.load_state_dict(state, strict=True)
+    # Fail if an SDK custom loader changed saved scales or offsets silently.
+    restored = model.state_dict()
+    for key, value in state.items():
+        if key.endswith(('.scale', '.zero_point')):
+            torch.testing.assert_close(restored[key].cpu(), value.cpu(), rtol=0, atol=0)
+    attention_fp16_only(model)
+    model.eval()
+    q.disable_observer(model)
+    return model

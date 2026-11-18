@@ -58,7 +58,7 @@ PYTHONPATH=. python tools/check_ep2_qat.py --config projects/configs/ep2/q1.py
 bash scripts/train_ep1.sh projects/configs/ep2/q1.py --resume-from work_dirs/ep2/q1/latest.pth
 ```
 恢复时按同一recipe重建量化模块并严格恢复量化状态和优化器。不要用FP模型直接加载QAT state_dict，也不要把QAT checkpoint误写为FP load_from。
-现有 `tools/val_ep.py` 的普通PTH路径尚未实现QAT结构重建，不能直接验证这种重命名后的checkpoint。导出也需SDK量化模块/QDQ与标尺对齐，原EP1 ONNX exporter不能直接用于QAT checkpoint。本次未宣称已通过板端INT8精度/编译/测速。
+`tools/val_ep.py` 支持带 oritek_qat 元数据的 QAT PTH：从 checkpoint recipe 重建卷积量化岛，严格恢复所有参数、observer范围、scale/zero_point，验证期间冻结observer且保持fake quant。无需FP初始化文件。必须安装与checkpoint相同版本SDK。原EP1 ONNX exporter仍不能直接用于QAT checkpoint；需要量化模块/QDQ与标尺对齐。
 
 ## 已完成的检查
 
@@ -69,3 +69,9 @@ q1/q2均通过真实训练样本前向、反向、一次优化器更新，梯度
 实测每卡batch4约28.9样本/秒，batch8约43.6，batch10约47.2，batch12约48.8（四卡合计，短测稳定区间；不含启动）。选batch12，显存日志峰值28144MiB。正式单步吞吐会随样本与observer阶段变化，GPU利用率仍可能波动。
 Q1/Q2均保持LR1e-5、不按batch放大。每轮586步、6轮3516步；observer在586步冻结，warmup167步对应原来近似相同样本数。observer开关仅在状态变化时更新，避免每个卷积重复递归设置。
 原Q1在第一个checkpoint前停止，重启从组合初始化训练，原日志归档于work_dirs/ep2/q1_before_batch12_*。本轮使用后台shell直接执行q1 && q2，q1成功后才会启动q2，无额外排队脚本。
+
+## QAT PTH 验证（3090）
+```bash
+PYTHONPATH=. python tools/val_ep.py ckpt/q1.pth --config projects/configs/ep2/q1.py --output val/q1_pth
+```
+已通过实际q1 checkpoint的两帧CUDA检查，未运行全量验证。普通PTH、ONNX入口保留。SDK模块结构用临时合成张量建立，随后全部量化状态被训练checkpoint严格覆盖；不会利用验证集更新训练标尺。
