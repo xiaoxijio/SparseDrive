@@ -6,5 +6,7 @@ from .detector import SparseDriveDetOcc
 
 __all__ = [
     'EfficientNetB0NoSE', 'PaddedInstanceBank', 'PaddedSparse4DHead',
-    'FlashOccBranch', 'OccImageNeck', 'SparseDriveDetOcc',
+    'FlashOccBranch', 'OccImageNeck', 'SparseDriveDetOcc', 'FastBEVOccBranch',
 ]
+
+from .fastbev import FastBEVOccBranch

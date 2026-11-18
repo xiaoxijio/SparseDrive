@@ -70,3 +70,78 @@ FPN 初始化按特征尺度映射（S5第0层对应S2第1层），不是简单�
 - `../ep2/q2.py`：q1 再加 S3，小 FFN=512。
 - 已训练分支按模块组合，q1来自S5+S4，q2来自S5+S4+S3；不是一份已经联合训练的模型。后续QAT同时承担组合后的适应训练。
 - 使用官方 Oritek 2.1.6 卷积伪量化，具体量化范围、训练/验证和导出约束见 `../ep2/README.md`。
+
+## S6：基于 S5 的 FastBEV 式 OCC 体素构建
+
+位置：3090 `/home/fjm/tong/SparseDrive`。只新增训练配置和体素转换模块，未启动正式训练。
+
+### 为什么改、改了什么
+
+官方参考：[Sense-GVT/Fast-BEV 的 fastbev.py](https://github.com/Sense-GVT/Fast-BEV/blob/dev/mmdet3d/models/detectors/fastbev.py)，重点是 `get_points`、`backproject_inplace`。官方方法从预定义的三维体素点投影到图像，按最近邻获取图像特征，多相机重叠处按相机顺序覆盖。它与 LSS 的深度概率展开、落点 scatter 求和不是等价运算。
+
+S6 继承 `s5_det_occ_decoder4_fpn3.py`，保持共享 backbone、3层检测FPN、4轮decoder、时序缓存、OCC图像neck、BEV编码器和18类预测头。仅将 OCC 的 LSSViewTransform 替换为 FastBEVViewTransform：
+
+1. 固定 ego 网格：X/Y `[-25.6,25.6,0.4]`、Z `[-1,5.4,0.4]`，128×128×16。与官方 get_points 一致用网格下角点，未增加半个体素偏移。
+2. 将图像特征由256通道投影为64通道，取消 OCC 深度概率预测/展开。
+3. 从每帧 `occ_img2ego` 计算逆映射，将体素点投影到六路图像。3×3伴随矩阵公式实现仿射逆，不引入 ONNX Inverse 或自定义算子。假定输入是本项目生成的可逆仿射标定矩阵，不能传零矩阵。
+4. 按图像/特征尺寸缩放坐标、round 最近邻、检查正深度和图像范围。相机列表后面的有效相机优先，保持官方 inplace 的覆盖语义。用 GridSample 和数值掩码实现，无 scatter 或布尔索引写入。
+5. **本项目的适配**：沿16个高度层取均值，得到64×128×128，再接原二维 BEV encoder。官方 FastBEV 会保留三维volume并由其后续neck处理；高度均值并非声称照搬其完整网络。无效体素为零，均值分母固定16，不是可见高度数量。
+
+这改变了 OCC 学习问题，需要重新训练。保留16层采样不代表其信息与原LSS相同。检测模块初值不变，但共享backbone联合训练后检测精度也可能变化。
+
+### 坐标和动态输入
+
+`projection_mat` 是检测分支的 lidar→image 映射。OCC 网格使用 ego 坐标，不能直接用它替代 OCC 投影；数据pipeline的 `occ_img2ego` 包含 image→ego 映射，S6 从这个矩阵恢复 ego→image。无需更改数据pipeline、标签、Collect或训练调用接口，两组矩阵仍可以逐帧变化。
+
+固定的是体素网格和图像尺寸，**不是相机标定**。本实现没有固定sample-0标定，也没有提前缓存相机采样索引。
+
+### 文件作用
+
+- `projects/mmdet3d_plugin/models/ep1/fastbev.py`：仿射逆、体素点、最近邻反投影、相机覆盖、高度均值；注册 FastBEVOccBranch，复用原loss和编码器。
+- `projects/mmdet3d_plugin/models/ep1/__init__.py`：导入并注册新增分支。
+- `projects/configs/ep1/s6_det_occ_decoder4_fpn3_fastbev.py`：继承S5，仅切换OCC分支类型、初始化权重和输出路径。
+- `ckpt/s6_from_s5_init.pth`：从 `ckpt/s5.pth` 转移的训练初始化，**不是训练完成的S6**。保留761个匹配张量；新context_net的weight/bias来自S5 depth_net最后64个context输出通道，丢弃其前面的深度输出通道；不携带优化器状态。完整state_dict已严格加载验证。
+- `tests/test_ep1_fastbev.py`：与独立的官方风格索引覆盖参考比较、梯度检查、小网格ONNX检查及两组动态标定的ORT对比。无需checkpoint，不会生成初始化权重。
+- `projects/mmdet3d_plugin/models/ep1/deployment.py`：固定LSS导出适配器明确拒绝S6，避免错误套用FixedRigPool。S6后续使用动态标定导出路径。
+
+### 训练
+
+```bash
+cd /home/fjm/tong/SparseDrive
+conda activate sparsedrive
+# 与S5相同的四卡、每卡batch16：20轮，8780 iter。
+bash tools/dist_train.sh projects/configs/ep1/s6_det_occ_decoder4_fpn3_fastbev.py 4 --no-validate
+```
+
+初始化文件已生成，无需先跑权重准备脚本。将工程迁到训练机时同时复制 `ckpt/s6_from_s5_init.pth`。配置保留S5的LR=2e-5、warmup500、动态loss scale、梯度裁剪及数据增强。
+
+**单卡3090不要直接把四卡配置当成相同20轮。**若显存允许batch16，单卡20轮用如下显式覆盖（若OOM需降低batch，并按 `28130 // batch` 重算每轮iter和总iter）：
+
+```bash
+PYTHONPATH=. python tools/train.py projects/configs/ep1/s6_det_occ_decoder4_fpn3_fastbev.py \
+  --no-validate --cfg-options data.samples_per_gpu=16 data.workers_per_gpu=4 \
+  runner.max_iters=35160 checkpoint_config.interval=1758
+```
+
+四卡和单卡的有效batch不同，上述并非保证等价的收敛设置。尚未测量S6全模型batch16的显存峰值。
+
+训练完成后评估：
+
+```bash
+PYTHONPATH=. python tools/val_ep.py work_dirs/ep1/s6_det_occ_decoder4_fpn3_fastbev/iter_8780.pth \
+  --config projects/configs/ep1/s6_det_occ_decoder4_fpn3_fastbev.py --output val/s6_pth
+```
+
+单卡训练则替换为实际最终checkpoint，例如iter_35160.pth。比较S5/S6的检测mAP、NDS与OCC mIoU，不能仅看训练loss。
+
+### 当前验证边界和编译
+
+已通过：独立参考数值一致；反向梯度有限；小网格ONNX checker及两组标定ORT一致；完整OCC分支在真实sample-0标定下输出 `[1,128,128,16,18]`，loss和输入特征梯度有限；S5迁移后的全模型state_dict严格加载。
+
+小规模导出未包含 ScatterElements、ScatterND 或矩阵Inverse。比较有效性采用数值掩码相乘，避免And和GreaterOrEqual。**仍有Round、GridSample、动态除法及投影运算，且当前按高度/相机展开为96次GridSample，不能因去掉scatter就宣称编译通过或板端更快。**需要后续完整S6动态ONNX、SDK实际编译、量化精度和上板测试。投影计算精度保护的问题也仍要处理。当前没有S6训练后精度、完整S6编译结果或板端性能结果。
+
+复现小规模检查：
+
+```bash
+PYTHONPATH=. python tests/test_ep1_fastbev.py
+```

@@ -205,6 +205,8 @@ class FixedRigDeployment(nn.Module):
                     module.camera_encoder = CachedCameraEncoder(module.camera_encoder, projection_mat)
                 module.feature_sampling = numeric_boundary_sampling
                 module.multi_view_level_fusion = MethodType(rank_six_fusion, module)
+        if not hasattr(self.model.occ_branch.view_transform, 'depth_net'):
+            raise ValueError('S6 FastBEV export requires --calibration-mode dynamic; fixed LSS pooling is incompatible')
         pool = FixedRigPool(self.model.occ_branch.view_transform, occ_img2ego)
         self.model.occ_branch.view_transform = pool.to(projection_mat.device)
         self.eval()
