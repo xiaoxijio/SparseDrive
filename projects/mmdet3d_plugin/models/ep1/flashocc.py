@@ -171,3 +171,66 @@ class FlashOccBranch(BaseModule):
         # clamp avoids a NaN when a sample has no visible/valid voxels.
         loss = (losses * valid.reshape(-1)).sum() / valid.sum().clamp(min=1)
         return {'loss_occ': loss * self.loss_weight}
+
+
+class IndexedLSSViewTransform(LSSViewTransform):
+    """Gather all valid S5 rays, then sum depth-weighted features per BEV cell."""
+
+    def forward(self, feature, img2ego):
+        batch_size, cameras = img2ego.shape[:2]
+        prediction = self.depth_net(feature.float())
+        depth = prediction[:, :self.num_depth].softmax(1).reshape(-1)
+        context = prediction[:, self.num_depth:].permute(0, 2, 3, 1)
+        height, width = context.shape[1:3]
+        context = context.reshape(-1, self.out_channels)
+        cells = self.nx * self.ny
+        with torch.no_grad():
+            xyz = (img2ego[:, :, None, None, None, :3, :]
+                   @ self.frustum[None, None, ..., None]).squeeze(-1)
+            xcfg, ycfg, zcfg = (self.grid_config[k] for k in ('x', 'y', 'z'))
+            x = ((xyz[..., 0] - xcfg[0]) / xcfg[2]).floor().long()
+            y = ((xyz[..., 1] - ycfg[0]) / ycfg[2]).floor().long()
+            z = xyz[..., 2]
+            valid = ((x >= 0) & (x < self.nx) & (y >= 0) & (y < self.ny)
+                     & (z >= zcfg[0]) & (z < zcfg[1]))
+            rays = valid.reshape(-1).nonzero(as_tuple=True)[0]
+            image_size = height * width
+            pixels = (rays // (self.num_depth * image_size)) * image_size + rays % image_size
+            offsets = torch.arange(batch_size, device=x.device).view(-1, 1, 1, 1, 1) * cells
+            cell_ids = (offsets + y * self.nx + x)[valid]
+            cell_ids, order = cell_ids.sort(stable=True)
+            rays, pixels = rays[order], pixels[order]
+            occupied, counts = torch.unique_consecutive(cell_ids, return_counts=True)
+            starts = counts.cumsum(0) - counts
+
+        bev = context.new_zeros(batch_size * cells, self.out_channels)
+        if not occupied.numel():
+            bev = bev + (depth.sum() + context.sum()) * 0
+        else:
+            # Bucket by ray count to limit padding without dropping any rays.
+            max_count = int(counts.max())
+            sums, indices = [], []
+            width = 1
+            while width // 2 < max_count:
+                select = (counts > width // 2) & (counts <= width)
+                offsets = torch.arange(width, device=x.device)
+                mask = offsets[None, :] < counts[select, None]
+                slots = starts[select, None] + offsets[None, :]
+                slots = slots.masked_fill(~mask, 0)
+                weights = depth[rays[slots]] * mask
+                sums.append((context[pixels[slots]] * weights[..., None]).sum(1))
+                indices.append(occupied[select])
+                width *= 2
+            bev = bev.index_copy(0, torch.cat(indices), torch.cat(sums))
+        return bev.view(batch_size, self.ny, self.nx, self.out_channels).permute(0, 3, 1, 2).contiguous()
+
+
+@HEADS.register_module()
+class IndexedFlashOccBranch(FlashOccBranch):
+    """S5 OCC head with index-based depth aggregation and identical parameters."""
+
+    def __init__(self, grid_config, input_size=(256, 704), in_channels=256,
+                 view_channels=64, **kwargs):
+        super().__init__(grid_config, input_size, in_channels, view_channels, **kwargs)
+        self.view_transform = IndexedLSSViewTransform(
+            in_channels, view_channels, grid_config, input_size)

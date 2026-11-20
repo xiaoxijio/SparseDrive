@@ -116,3 +116,15 @@ bash scripts/train_ep1.sh projects/configs/ep2/q4.py
 初始化文件已存在时不要重复生成。日志和权重位于 `work_dirs/ep2/q4/`。Q4需独立比较mAP/NDS/mIoU，不能因参数量下降就推断精度或板端速度。
 
 本次Q4通过真实样本前向/反向/一次更新和量化状态严格保存加载检查，565个梯度张量有限，320个标尺缓冲一致。四卡正式训练已到50/5274步，loss_occ约0.1946、总loss约8.8246、grad_norm约14.1393，显存日志峰值27532MiB；仅表示初期训练正常。
+
+## Q5
+
+`q5.py` 继承 S7 的深度加权索引池化，使用 Oritek SDK 2.1.6 的卷积 INT8 伪量化。几何、索引聚合和线性预测头保留浮点计算。主网络使用 FP32，FlashAttention 内部使用局部 FP16。
+
+3090 当前可用的初始化为 `ckpt/s5.pth`，与 S7 参数结构兼容。有训练完成的 S7 权重后，可通过 `--cfg-options load_from=ckpt/s7.pth` 指定它。默认四卡每卡 batch 4，基础学习率 `1e-5`，warmup 500 步，6 轮，每 1758 步保存，observer 从第 1758 步起冻结。
+
+```bash
+bash scripts/train_ep1.sh projects/configs/ep2/q5.py
+```
+
+现有 S6/FastBEV 导出入口需要另外接入 S7 的索引池化。

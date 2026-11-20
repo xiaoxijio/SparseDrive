@@ -251,7 +251,7 @@ class OritekQATHook(Hook):
         self._sync(runner.model.module, self.recipe.get('coalesced_sync', False))
 
 
-def restore_qat_for_eval(model, checkpoint, recipe):
+def restore_qat_for_eval(model, checkpoint, recipe, *, native_attention=True):
     """Rebuild SDK Conv islands and strictly restore trained quantization state.
 
     Synthetic tensors only instantiate the SDK schema; every weight, observer
@@ -290,7 +290,8 @@ def restore_qat_for_eval(model, checkpoint, recipe):
     for key, value in state.items():
         if key.endswith(('.scale', '.zero_point')):
             torch.testing.assert_close(restored[key].cpu(), value.cpu(), rtol=0, atol=0)
-    attention_fp16_only(model)
+    if native_attention:
+        attention_fp16_only(model)
     model.eval()
     q.disable_observer(model)
     return model

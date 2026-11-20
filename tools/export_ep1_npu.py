@@ -9,9 +9,11 @@ from pathlib import Path
 import numpy as np
 import torch
 from mmdet.datasets import build_dataset
+from tools.s6_sampling_layout import aggregate_in_sampling_layout, move_sampling_mask
 from tools.ep1_common import load_model, sample_to_device, make_export_inputs, occ_forward_projection
 from projects.mmdet3d_plugin.models.ep1.deployment import (
     DynamicRigDeployment, DYNAMIC_INPUT_NAMES, OUTPUT_NAMES)
+
 
 def align_cache_rows(expected, actual):
     """Compare jointly permuted TopK cache rows without changing model outputs.
@@ -33,29 +35,51 @@ def main():
     import onnx
     import onnxruntime as ort
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', default='projects/configs/ep1/s6_det_occ_decoder4_fpn3_fastbev.py')
-    parser.add_argument('--checkpoint', default='ckpt/iter_3512.pth')
+    parser.add_argument('--config', default=None)
+    parser.add_argument('--checkpoint', default=None)
     parser.add_argument('--calibration-mode', choices=('dynamic', 'fixed'), default='dynamic')
     parser.add_argument('--calibration', help='npz with projection_mat, image_wh, occ_img2ego')
     parser.add_argument('--sample-index', type=int, default=0)
-    parser.add_argument('--output', help='Defaults to onnx/s6/s6.onnx (dynamic) or onnx/s6/s6_fixed.onnx')
+    parser.add_argument('--output', help='Defaults to onnx/<checkpoint stem>/<stem>[_fixed].onnx')
     parser.add_argument('--verbose-warnings', action='store_true', help='Print each export warning as well as recording it')
     parser.add_argument('--check-only', action='store_true', help='Validate an existing ONNX without exporting again')
     parser.add_argument('--no-simplify', dest='simplify', action='store_false',
                         help='Disable default onnxsim simplification for debugging')
     args = parser.parse_args()
+    args.checkpoint = args.checkpoint or 'ckpt/s6.pth'
+    stem = Path(args.checkpoint).stem
+    if args.config is None:
+        if stem in ('q3', 'q4'):
+            args.config = f'projects/configs/ep2/{stem}.py'
+        else:
+            args.config = 'projects/configs/ep1/s6_det_occ_decoder4_fpn3_fastbev.py'
     if args.simplify and not args.check_only:
         try:
             from onnxsim import simplify
         except ImportError:
             parser.error('Default simplification requires onnxsim; install it with python -m pip install onnxsim, or use --no-simplify for debugging')
     torch.manual_seed(0); torch.set_num_threads(4)
-    cfg, model = load_model(args.config, args.checkpoint, device='cpu', export_checkpoint=True)
+    from mmcv import Config
+    cfg = Config.fromfile(args.config)
+    qat_meta = None
+    if cfg.get('qat'):
+        from mmdet.models import build_detector
+        from projects.mmdet3d_plugin.apis.ep2_qat import restore_qat_for_eval
+
+        checkpoint = torch.load(args.checkpoint, map_location='cpu')
+        qat_meta = checkpoint.get('meta', {}).get('oritek_qat')
+        cfg.model.img_backbone.pretrained = None
+        model = restore_qat_for_eval(build_detector(cfg.model), checkpoint, cfg.qat, native_attention=False)
+        del checkpoint
+
+    else:
+        cfg, model = load_model(args.config, args.checkpoint, device='cpu', export_checkpoint=True)
     model.eval()
     dataset = build_dataset(cfg.data.val)
     data = sample_to_device(dataset, args.sample_index, device=-1)
     original = list(make_export_inputs(model, data))
-    output = Path(args.output or ('onnx/s6/s6_fixed.onnx' if args.calibration_mode == 'fixed' else 'onnx/s6/s6.onnx')); output.parent.mkdir(parents=True, exist_ok=True)
+    suffix = "_fixed" if args.calibration_mode == "fixed" else ""
+    output = Path(args.output or f'onnx/{stem}/{stem}{suffix}.onnx'); output.parent.mkdir(parents=True, exist_ok=True)
     if args.check_only and not args.calibration:
         args.calibration = str(output.with_suffix('.calibration.npz'))
     if args.calibration:
@@ -80,7 +104,7 @@ def main():
     report = dict(calibration=calibration_source, checkpoint=args.checkpoint,
                   initialization=cfg.get('load_from'), inputs=input_names, outputs=OUTPUT_NAMES, calibration_mode=args.calibration_mode,
                   host_validity_required=True, time_interval_dynamic=True,
-                  npu_compilation_tested=False)
+                  npu_compilation_tested=False, qat=qat_meta)
     if not args.check_only:
         with warnings.catch_warnings(record=True) as captured:
             warnings.simplefilter('always')
@@ -100,6 +124,16 @@ def main():
                 for w in captured:
                     sys.stderr.write(warnings.formatwarning(w.message,w.category,w.filename,w.lineno))
     graph = onnx.load(str(output))
+    if qat_meta:
+        # The SDK adapter adds a scope to node names used by the S6 passes.
+        for node in graph.graph.node:
+            if node.name.startswith('/model/'):
+                node.name = node.name[len('/model'):]
+        report['qdq_nodes'] = {op: sum(node.op_type == op for node in graph.graph.node)
+                               for op in ('QuantizeLinear', 'DequantizeLinear')}
+        report['quantization_export'] = 'SDK fake quant traced via PyTorch ONNX exporter'
+        if not all(report['qdq_nodes'].values()):
+            raise ValueError('QAT export lost the Q/DQ operators')
     for node in graph.graph.node:
         if node.op_type == 'Resize' and any(a.name == 'mode' and a.s == b'linear' for a in node.attribute):
             for a in node.attribute:
@@ -111,7 +145,7 @@ def main():
     # Avoid the SDK's false QAT match on real pixel-coordinate clipping.
     rewritten = []
     for node in graph.graph.node:
-        if node.op_type != 'Clip' or not node.name.startswith('/occ_branch/view_transform/'):
+        if node.op_type != 'Clip' or '/occ_branch/view_transform/' not in node.name:
             rewritten.append(node); continue
         bounds = [(i,x) for i,x in enumerate(node.input[1:]) if x]
         current = node.input[0]
@@ -120,6 +154,12 @@ def main():
             rewritten.append(onnx.helper.make_node('Max' if i==0 else 'Min', [current,x], [out], name=node.name+'_bound_op_'+str(i)))
             current = out
     del graph.graph.node[:]; graph.graph.node.extend(rewritten)
+    if not args.check_only:
+        graph, masks = move_sampling_mask(graph)
+        graph, layout_blocks = aggregate_in_sampling_layout(graph)
+        if len(masks) != 4 or layout_blocks != 4:
+            raise ValueError(f'Expected four sampling blocks, rewrote {layout_blocks}')
+        report['sampling_layout_blocks'] = layout_blocks
     if fixed_rig:
         matrices = dict(zip(DYNAMIC_INPUT_NAMES[1:3], inputs[1:3]))
         for value in list(graph.graph.input):

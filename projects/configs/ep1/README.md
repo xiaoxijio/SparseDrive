@@ -175,3 +175,9 @@ bash 03_omg.sh
 本次 `iter_3512.pth` 已实际生成 `/home/fjm/tong/Compilation/app/sparse/models/s6.ortm`，1437个算子全部NPU，无自定义CPU插件。SDK单核模拟约343.19ms/2.91383 FPS，非实体板实测。首帧SDK fake-quant输出均有限，但体素类别一致率约91.23%、检测仍有明显量化差异，INT8精度未验收；不能将该比例作为mIoU。
 
 固定和动态两种标定的导出、校准和编译步骤见 [S6 ONNX 编译流程](../../../docs/s6_onnx_compile.md)。
+
+## S7
+
+S7 保留 S5 的检测结构、深度预测、BEV 编码器和 OCC 预测头。BEV 聚合按每帧外参生成索引，查表取出图像特征和深度权重并逐格求和，按有效采样数分桶，保留全部有效采样项。直接加载 `ckpt/s5.pth`。四卡每卡 batch 4，基础学习率 `1e-5`，warmup 500 步，训练 6 轮。
+
+两帧真实标定下，索引池化与 S5 CUDA pooling 的最大绝对差约 `2.86e-6`，输入特征梯度也通过对照。S7 的 QAT 版本见 EP2 的 `q5.py`。
