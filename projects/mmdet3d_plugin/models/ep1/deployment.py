@@ -221,3 +221,36 @@ class FixedRigDeployment(nn.Module):
             history_transform, time_interval, history_valid)
         # Int32 is more portable for OMG than int64; no logits leave this graph.
         return outputs[:3] + (outputs[3].argmax(-1).to(torch.int32),) + outputs[4:]
+
+
+DYNAMIC_INPUT_NAMES = ['img', 'projection_mat', 'occ_ego2img'] + INPUT_NAMES[1:]
+
+
+class DynamicRigDeployment(nn.Module):
+    """S6 runtime camera geometry; only image dimensions are fixed."""
+    def __init__(self, model, image_wh):
+        super().__init__()
+        self.model = copy.deepcopy(model).eval()
+        self.register_buffer('image_wh', image_wh.detach().clone())
+        head = self.model.head.det_head
+        head.anchor_encoder = CachedInitialEncoder(head.anchor_encoder, head.instance_bank.anchor[None])
+        head.graph_model = MethodType(single_temporal_attention, head)
+        head.instance_bank.get = MethodType(deployment_bank_get, head.instance_bank)
+        for module in self.model.modules():
+            if isinstance(module, DeformableFeatureAggregation):
+                module.feature_sampling = numeric_boundary_sampling
+                module.multi_view_level_fusion = MethodType(rank_six_fusion, module)
+        from .fastbev import FastBEVViewTransform
+        if not isinstance(self.model.occ_branch.view_transform, FastBEVViewTransform):
+            raise ValueError('Dynamic LQ560 export now supports S6 FastBEV only')
+        view = self.model.occ_branch.view_transform
+        view.forward = MethodType(FastBEVViewTransform.forward_projected, view)
+
+    def forward(self, img, projection_mat, occ_ego2img, history_feature,
+                history_anchor, history_confidence, history_transform,
+                time_interval, history_valid):
+        self.model.head.det_head.anchor_encoder.first = True
+        outputs = self.model.forward_export(img, projection_mat, self.image_wh,
+            occ_ego2img, history_feature, history_anchor, history_confidence,
+            history_transform, time_interval, history_valid)
+        return outputs[:3] + (outputs[3].argmax(-1).to(torch.int32),) + outputs[4:]

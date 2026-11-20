@@ -16,6 +16,8 @@ class FastBEVChecks(unittest.TestCase):
         a[:,:,0,0]=0.5; a[:,:,1,1]=0.5
         torch.testing.assert_close(affine_inverse(a), torch.linalg.inv(a)[...,:3,:])
         y=m(x,a)
+        from tools.ep1_common import occ_forward_projection
+        torch.testing.assert_close(m.forward_projected(x,occ_forward_projection(a)),y,rtol=0,atol=0)
         # Independent official-style indexed overwrite reference.
         f=m.context_net(x).reshape(2,3,2,4,4)
         projection=torch.linalg.inv(a)[...,:3,:]

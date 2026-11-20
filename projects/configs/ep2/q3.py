@@ -1,11 +1,11 @@
-"""Q3: original trained S5 architecture with official Oritek Conv2d INT8 QAT.
+"""Q3: trained S6 FastBEV architecture with official Oritek Conv2d INT8 QAT.
 Retain OCC BEV channels [128,256,512]; no S3 FFN or S4 OCC reduction.
 Default schedule targets four 32-GB GPUs, not the single 3090 host.
 """
-_base_ = '../ep1/s5_det_occ_decoder4_fpn3.py'
+_base_ = '../ep1/s6_det_occ_decoder4_fpn3_fastbev.py'
 work_dir = './work_dirs/ep2/q3'
-# Directly reuse the trained S5 checkpoint; no branch composition/new layers.
-load_from = 'ckpt/s5.pth'
+# Reuse final S6 iter_8780 weights; FastBEV geometry stays floating point.
+load_from = 'ckpt/s6.pth'
 resume_from = None
 fp16 = None
 model = dict(img_backbone=dict(with_cp=False))

@@ -29,6 +29,10 @@ def load_export_checkpoint(model, checkpoint):
     if key in model.state_dict():
         raise RuntimeError('Expected a nonpersistent frustum in the export model')
     removed = state.pop(key, None) is not None
+    voxel_key = 'occ_branch.view_transform.voxel_points'
+    if voxel_key in state:
+        expected = model.occ_branch.view_transform.voxel_points.cpu()
+        torch.testing.assert_close(state.pop(voxel_key), expected, rtol=0, atol=0)
     model.load_state_dict(state, strict=True)
     print('Export checkpoint loaded strictly; regenerated frustum removed:', removed,
           flush=True)
@@ -82,3 +86,15 @@ class ExportWrapper(torch.nn.Module):
 
     def forward(self, *inputs):
         return self.model.forward_export(*inputs)
+
+
+def occ_forward_projection(img2ego):
+    """Host FP32 calibration preparation matching the trained S6 arithmetic."""
+    from projects.mmdet3d_plugin.models.ep1.fastbev import affine_inverse
+    with torch.no_grad():
+        projection = torch.zeros_like(img2ego, dtype=torch.float32)
+        projection[..., :3, :] = affine_inverse(img2ego.float())
+        projection[..., 3, 3] = 1
+    if not torch.isfinite(projection).all():
+        raise ValueError('OCC calibration must be invertible and finite')
+    return projection

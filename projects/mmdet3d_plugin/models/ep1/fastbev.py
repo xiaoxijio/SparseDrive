@@ -37,13 +37,17 @@ class FastBEVViewTransform(nn.Module):
         self.register_buffer('voxel_points', torch.stack((x, y, z, torch.ones_like(x)), -1), persistent=False)
 
     def forward(self, feature, img2ego):
-        b, n = img2ego.shape[:2]
+        return self.forward_projected(feature, affine_inverse(img2ego.float()))
+
+    def forward_projected(self, feature, ego2img):
+        """Same sampler, accepting forward projection for deployment."""
+        b, n = ego2img.shape[:2]
         context = self.context_net(feature.float())
         _, c, h, w = context.shape
         context = context.reshape(b, n, c, h, w)
         # OCC coordinates are ego coordinates; Sparse projection_mat uses lidar.
         # Invert OCC's affine mapping, never substitute the detection matrix.
-        projection = affine_inverse(img2ego.float())
+        projection = ego2img[..., :3, :].float()
         planes = []
         for zi in range(self.nz):
             points = self.voxel_points[zi].reshape(-1, 4).t()

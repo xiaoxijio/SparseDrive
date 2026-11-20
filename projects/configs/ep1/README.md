@@ -81,17 +81,17 @@ FPN 初始化按特征尺度映射（S5第0层对应S2第1层），不是简单�
 
 S6 继承 `s5_det_occ_decoder4_fpn3.py`，保持共享 backbone、3层检测FPN、4轮decoder、时序缓存、OCC图像neck、BEV编码器和18类预测头。仅将 OCC 的 LSSViewTransform 替换为 FastBEVViewTransform：
 
-1. 固定 ego 网格：X/Y `[-25.6,25.6,0.4]`、Z `[-1,5.4,0.4]`，128×128×16。与官方 get_points 一致用网格下角点，未增加半个体素偏移。
+1. X/Y投影网格为 `[-25.6,25.6,0.4]`。当前已训练S6继承的投影Z配置是 `[-1,5.4,6.4]`，因此只有 `z=-1` 一个128×128采样平面。预测标签另有16个高度层，两者不是同一个网格。与官方 get_points 一致用网格下角点，未增加半个体素偏移。
 2. 将图像特征由256通道投影为64通道，取消 OCC 深度概率预测/展开。
 3. 从每帧 `occ_img2ego` 计算逆映射，将体素点投影到六路图像。3×3伴随矩阵公式实现仿射逆，不引入 ONNX Inverse 或自定义算子。假定输入是本项目生成的可逆仿射标定矩阵，不能传零矩阵。
 4. 按图像/特征尺寸缩放坐标、round 最近邻、检查正深度和图像范围。相机列表后面的有效相机优先，保持官方 inplace 的覆盖语义。用 GridSample 和数值掩码实现，无 scatter 或布尔索引写入。
-5. **本项目的适配**：沿16个高度层取均值，得到64×128×128，再接原二维 BEV encoder。官方 FastBEV 会保留三维volume并由其后续neck处理；高度均值并非声称照搬其完整网络。无效体素为零，均值分母固定16，不是可见高度数量。
+5. **本项目的适配**：按配置的采样高度层取均值，得到64×128×128，再接原二维BEV encoder；当前仅一个采样平面，因此均值没有额外作用。官方FastBEV保留三维volume并由其后续neck处理，本实现不是完整复刻。若以后改成16个采样高度，属于结构变化，需要重新训练，不能直接拿当前checkpoint冒充该结构。
 
-这改变了 OCC 学习问题，需要重新训练。保留16层采样不代表其信息与原LSS相同。检测模块初值不变，但共享backbone联合训练后检测精度也可能变化。
+这改变了 OCC 学习问题，需要重新训练。当前单平面采样不等同于原LSS的深度聚合，也不等同于16层FastBEV体素采样。检测模块初值不变，但共享backbone联合训练后检测精度也可能变化。
 
 ### 坐标和动态输入
 
-`projection_mat` 是检测分支的 lidar→image 映射。OCC 网格使用 ego 坐标，不能直接用它替代 OCC 投影；数据pipeline的 `occ_img2ego` 包含 image→ego 映射，S6 从这个矩阵恢复 ego→image。无需更改数据pipeline、标签、Collect或训练调用接口，两组矩阵仍可以逐帧变化。
+`projection_mat` 是检测分支的 lidar→image 映射。OCC 网格使用 ego 坐标，不能直接用它替代 OCC 投影；数据pipeline的 `occ_img2ego` 包含 image→ego 映射，PTH训练时S6从这个矩阵恢复ego→image。无需改训练数据pipeline、标签或Collect。ONNX部署改为由输入预处理计算正向 `occ_ego2img` 并逐帧传入，避免图内逆矩阵子图，检测的projection_mat仍独立逐帧输入。
 
 固定的是体素网格和图像尺寸，**不是相机标定**。本实现没有固定sample-0标定，也没有提前缓存相机采样索引。
 
@@ -102,7 +102,7 @@ S6 继承 `s5_det_occ_decoder4_fpn3.py`，保持共享 backbone、3层检测FPN�
 - `projects/configs/ep1/s6_det_occ_decoder4_fpn3_fastbev.py`：继承S5，仅切换OCC分支类型、初始化权重和输出路径。
 - `ckpt/s6_from_s5_init.pth`：从 `ckpt/s5.pth` 转移的训练初始化，**不是训练完成的S6**。保留761个匹配张量；新context_net的weight/bias来自S5 depth_net最后64个context输出通道，丢弃其前面的深度输出通道；不携带优化器状态。完整state_dict已严格加载验证。
 - `tests/test_ep1_fastbev.py`：与独立的官方风格索引覆盖参考比较、梯度检查、小网格ONNX检查及两组动态标定的ORT对比。无需checkpoint，不会生成初始化权重。
-- `projects/mmdet3d_plugin/models/ep1/deployment.py`：固定LSS导出适配器明确拒绝S6，避免错误套用FixedRigPool。S6后续使用动态标定导出路径。
+- `projects/mmdet3d_plugin/models/ep1/deployment.py`：固定LSS导出适配器明确拒绝S6。S6动态适配器使用正向occ_ego2img输入和同一个FastBEV采样方法，避免图内求逆。
 
 ### 训练
 
@@ -138,10 +138,38 @@ PYTHONPATH=. python tools/val_ep.py work_dirs/ep1/s6_det_occ_decoder4_fpn3_fastb
 
 已通过：独立参考数值一致；反向梯度有限；小网格ONNX checker及两组标定ORT一致；完整OCC分支在真实sample-0标定下输出 `[1,128,128,16,18]`，loss和输入特征梯度有限；S5迁移后的全模型state_dict严格加载。
 
-小规模导出未包含 ScatterElements、ScatterND 或矩阵Inverse。比较有效性采用数值掩码相乘，避免And和GreaterOrEqual。**仍有Round、GridSample、动态除法及投影运算，且当前按高度/相机展开为96次GridSample，不能因去掉scatter就宣称编译通过或板端更快。**需要后续完整S6动态ONNX、SDK实际编译、量化精度和上板测试。投影计算精度保护的问题也仍要处理。当前没有S6训练后精度、完整S6编译结果或板端性能结果。
+小规模导出未包含 ScatterElements、ScatterND 或矩阵Inverse。比较有效性采用数值掩码相乘，避免And和GreaterOrEqual。当前按一个高度/六相机展开为6次GridSample。完整导出、标准算子部署改写、FP16几何保护及实际编译流程见下节；量化后的全量精度和实体板性能需要独立验证。
 
 复现小规模检查：
 
 ```bash
 PYTHONPATH=. python tests/test_ep1_fastbev.py
 ```
+
+### S6 动态标定部署（iter_3512.pth）
+
+```bash
+cd /home/fjm/tong/SparseDrive
+PYTHONPATH=. python tools/export_ep1_npu.py \
+  --config projects/configs/ep1/s6_det_occ_decoder4_fpn3_fastbev.py \
+  --checkpoint ckpt/iter_3512.pth --output onnx/s6/s6.onnx
+PYTHONPATH=. python /home/fjm/tong/Compilation/app/sparse/prepare_calibration.py \
+  --onnx onnx/s6/s6.onnx --frames 4
+cd /home/fjm/tong/Compilation/app/sparse
+bash 00_init.sh /home/fjm/tong/SparseDrive/onnx/s6/s6.onnx
+bash 01_check.sh
+bash 02_preprocess.sh
+bash 03_omg.sh
+```
+
+默认导出参数即为上述S6配置、checkpoint和路径，以后换权重用 `--checkpoint`、换输出用 `--output`。保留参数 `--no-simplify` 用于排查，默认onnxsim简化；`--check-only`只复核已有图。输出ONNX、匹配的calibration.npz和validation.txt；不再生成临时JSON报告。
+
+**接口变化**：ONNX输入是 `img, projection_mat, occ_ego2img, history_feature, history_anchor, history_confidence, history_transform, time_interval, history_valid`。两个投影均为每帧真实输入，image_wh固定。OCC改为ego→image的正向矩阵；原数据的image→ego矩阵由 `tools.ep1_common.occ_forward_projection` 在输入准备阶段转换，运算与训练FP32公式一致。`tools/onnx_stage1.py`验证/可视化及 `tools/export_ep_geometry.py`已支持新接口。不要将旧occ_img2ego原值或检测的projection_mat直接填到occ_ego2img输入。无需重新训练就能使用这个部署接口。
+
+导出比较覆盖首帧、历史、重置和不同标定；第二样本1个体素类别变化，前两类logit分差约4.77e-7、最大logit误差约9.92e-5，报告会记录而不隐藏。要求logits继续满足3e-3原容差，并限制类别翻转处的logit分差。部署图改写的四帧OCC logits误差为0，检测/缓存最大误差约1.42e-4。
+
+编译仅使用标准算子：坐标Clip改为Min/Max，避免SDK误判QAT；浮点比较掩码改为有限输入下等价的ceil/Min/Max表达，绕过FP16比较+Cast后端限制；相机MatMul二维化；边界mask移到分组采样权重以减少重复乘法。学习特征INT8、几何坐标及必要常量FP16；配置和文件作用详见已有 [Compilation/app/sparse/README.md](/home/fjm/tong/Compilation/app/sparse/README.md)。S2的自定义CPU池化不再使用。
+
+四帧校准只验证编译流程，不能替代代表性量化校准集、全量mAP/NDS/mIoU评估或实体板测速。
+
+本次 `iter_3512.pth` 已实际生成 `/home/fjm/tong/Compilation/app/sparse/models/s6.ortm`，1437个算子全部NPU，无自定义CPU插件。SDK单核模拟约343.19ms/2.91383 FPS，非实体板实测。首帧SDK fake-quant输出均有限，但体素类别一致率约91.23%、检测仍有明显量化差异，INT8精度未验收；不能将该比例作为mIoU。

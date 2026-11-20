@@ -240,7 +240,7 @@ class DeformableFeatureAggregation(BaseModule):
         for fm in feature_maps:
             features.append(
                 torch.nn.functional.grid_sample(
-                    fm.flatten(end_dim=1), points_2d
+                    fm.flatten(end_dim=1), points_2d, align_corners=False
                 )
             )
         features = torch.stack(features, dim=1)

@@ -113,6 +113,7 @@ def convert_convolutions(model, recipe, forward_example):
     # Make the fixed OCC resampling grid explicit in QAT state so both torch
     # and MMCV checkpoints have the same strict-loading schema.
     model.occ_branch.view_transform._non_persistent_buffers_set.discard('frustum')
+    model.occ_branch.view_transform._non_persistent_buffers_set.discard('voxel_points')
     model.register_buffer('_qat_format_version', torch.tensor(FORMAT_VERSION))
     model._oritek_qat_recipe = copy.deepcopy(dict(recipe))
     model.train(was_training)
@@ -146,7 +147,14 @@ def prepare_training(model, loader, cfg, logger):
         raise ValueError('Use explicit --resume-from for QAT; auto_resume is disabled')
     if any(h.get('type') == 'MEGVIIEMAHook' for h in cfg.get('custom_hooks', [])):
         raise ValueError('Disable MEGVIIEMAHook for QAT quantizer state')
-    if not cfg.resume_from:
+    # Explicit resume takes precedence over the original warm-start initializer.
+    qat_init = None if cfg.resume_from else cfg.get('qat_init_from')
+    if qat_init and cfg.load_from:
+        raise ValueError('qat_init_from is a QAT warm start; do not combine with FP load_from')
+    if qat_init:
+        checkpoint = torch.load(qat_init, map_location='cpu')
+        validate_recipe(checkpoint, cfg.qat)
+    elif not cfg.resume_from:
         if not cfg.load_from:
             raise ValueError('QAT needs a trained FP load_from checkpoint')
         # Fail on missing or mismatched tensors, including migrated OCC weights.
@@ -157,6 +165,10 @@ def prepare_training(model, loader, cfg, logger):
         state = {k[7:] if k.startswith('module.') else k: v for k,v in state.items()}
         if 'occ_branch.view_transform.frustum' not in model.state_dict():
             state.pop('occ_branch.view_transform.frustum', None)
+        grid_key = 'occ_branch.view_transform.voxel_points'
+        if grid_key in state and grid_key not in model.state_dict():
+            expected = model.occ_branch.view_transform.voxel_points.cpu()
+            torch.testing.assert_close(state.pop(grid_key).cpu(), expected, rtol=0, atol=0)
         model.load_state_dict(state, strict=True)
         logger.info('Loaded FP weights before QAT conversion: %s', cfg.load_from)
     else:
@@ -177,10 +189,14 @@ def prepare_training(model, loader, cfg, logger):
     model.head.det_head.instance_bank.reset()
     del batch
     model.cuda()
-    if cfg.resume_from:
+    if cfg.resume_from or qat_init:
         # Strict check now; runner.resume later restores optimizer/scheduler/epoch.
         model.load_state_dict(checkpoint['state_dict'], strict=True)
+        # SDK loaders can restore observer tensors on CPU even for a CUDA model.
+        model.cuda(torch.cuda.current_device())
         model._qat_observer_mode = None
+        if qat_init:
+            logger.info('Strict QAT warm start loaded: %s; optimizer and iteration reset', qat_init)
     cfg.load_from = None  # runner must not reload FP weights into renamed QAT layers
     return model
 
@@ -263,6 +279,7 @@ def restore_qat_for_eval(model, checkpoint, recipe):
         _persist_scales(quant)
         parent._modules[leaf] = quant
     model.occ_branch.view_transform._non_persistent_buffers_set.discard('frustum')
+    model.occ_branch.view_transform._non_persistent_buffers_set.discard('voxel_points')
     model.register_buffer('_qat_format_version', torch.tensor(FORMAT_VERSION))
     state = checkpoint['state_dict']
     if state and all(k.startswith('module.') for k in state):

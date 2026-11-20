@@ -76,14 +76,43 @@ PYTHONPATH=. python tools/val_ep.py ckpt/q1.pth --config projects/configs/ep2/q1
 ```
 已通过实际q1 checkpoint的两帧CUDA检查，未运行全量验证。普通PTH、ONNX入口保留。SDK模块结构用临时合成张量建立，随后全部量化状态被训练checkpoint严格覆盖；不会利用验证集更新训练标尺。
 
-## Q3：S5 的独立 QAT 版本
+## Q3：以 S6 FastBEV 为基础的 QAT
 
-配置 `q3.py` 直接继承 EP1 S5，`load_from=ckpt/s5.pth`（训练完成的S5），不做分支组合、不重新初始化任何结构层。保留4轮decoder、FFN1024、3层FPN，以及原大OCC编码器[128,256,512]。因此不继承S4小OCC编码器及其新BN统计量问题。
-采用与q1/q2相同的官方SDK 2.1.6 Conv2d混合精度QAT，主网络/伪量化FP32，FlashAttention局部FP16；大OCC编码器的已训练BN仍冻结。
-默认用于四张32GB GPU：每卡batch8、每轮879步、6轮5274步，LR1e-5（backbone5e-6），warmup250步，observer在879步冻结，每轮保存、最近3份。增大OCC主干后未沿用q1/q2的batch12，四卡长期显存/吞吐尚未测试。
-3090单卡只做一批样本的检查；通用训练脚本仍启动4卡，不要在单卡3090上直接按四卡命令启动。
-四卡服务器准备相同S5 checkpoint和配置后：
+`q3.py`继承EP1 `s6_det_occ_decoder4_fpn3_fastbev.py`，从最终S6权重初始化，不再使用S5的LSS结构。保留4轮decoder、FFN1024、3层FPN、大OCC编码器[128,256,512]。FastBEV当前在z=-1单平面反投影，输出预测仍为128×128×16、18类。
+
+`load_from=ckpt/s6.pth`。本次服务器上该路径指向 `work_dirs/ep1/s6_det_occ_decoder4_fpn3_fastbev/iter_8780.pth`，使用训练最终权重，不是iter_3512中间权重。不恢复S6优化器，QAT从第0步开始独立训练。
+
+采用SDK 2.1.6 Conv2d混合精度QAT：量化范围是backbone、检测FPN、OCC图像neck、OCC分支中的卷积，包括FastBEV的context_net；几何求逆/投影、GridSample、掩码、注意力、Linear、Softplus及损失保持浮点。它不等于整个网络INT8，也不能直接保证上一轮OMG全网PTQ的量化误差被解决。后续QAT导出与编译必须对齐相同量化范围和训练标尺，不能再直接套用普通FP checkpoint导出器。
+
+四卡每卡batch8、global32，每轮879步，6轮5274步；LR1e-5、backbone5e-6，warmup250步，第一轮后冻结observer，BN从开始冻结。全局fp16=None，只让FlashAttention局部FP16，关闭backbone checkpointing。每879步保存，保留最近3份。
+
+QAT加载时只在严格核对生成网格完全一致后忽略FP checkpoint中的voxel_points缓存。转换后把网格显式持久化，确保PyTorch/MMCV保存和恢复使用相同state_dict；QAT checkpoint同时保存量化标尺及recipe。
+
 ```bash
+cd /root/SparseDrive
+conda activate sparsedrive
 bash scripts/train_ep1.sh projects/configs/ep2/q3.py
 ```
-训练后应对比原S5浮点权重的mIoU/mAP，不能仅凭loss推断QAT精度保留。
+
+后台日志 `work_dirs/ep2/q3/launch.log`，输出权重在同一目录。断点续训使用 `--resume-from work_dirs/ep2/q3/latest.pth`，不要将QAT checkpoint作为普通FP load_from。
+
+本次真实样本检查已通过前向、反向、一次优化器更新和量化状态严格保存/加载：565个梯度张量均有限，320个scale/zero_point缓冲一致。四卡正式训练已跑到50/5274步，loss_occ约0.2125、总loss约7.5111，日志显存峰值约27607MiB。仅确认启动和初期训练正常，未代表最终精度或收敛。
+
+## Q4：Q3 FastBEV QAT + S3 FFN512
+
+`q4.py`继承Q3，只将4个检测FFN的hidden从1024改为512。其余结构、FastBEV单平面采样、大OCC编码器、3层FPN、query/历史数量和QAT范围不变。FFN的Linear仍为浮点，这里是S3的结构缩减，不是新增Linear INT8量化。
+
+初始化由 `tools/prepare_ep2_weights.py projects/configs/ep2/q4.py` 生成 `ckpt/q4_qat_init.pth`：保留最终Q3 `work_dirs/ep2/q3/iter_5274.pth` 的卷积QAT权重、320个scale/zero_point缓冲和其他匹配状态；四个FFN完整使用已训练S3 `work_dirs/ep1/s3_det_occ_decoder4_ffn512/iter_8780.pth` 对应参数，不随意截取Q3权重。结构变化需要联合适应训练，不能当作等价推理替换。
+
+`qat_init_from`表示量化模型权重暖启动，区别于普通FP load_from和断点resume_from：先按recipe重建量化模块，再严格加载全部初始化状态；不恢复旧优化器、epoch或iter。训练仍为四卡每卡batch8、6轮5274步，LR1e-5，warmup250；BN立即冻结，observer重新观察一轮后冻结。checkpoint每879步保存，保留最近3份。
+
+```bash
+cd /root/SparseDrive
+conda activate sparsedrive
+PYTHONPATH=. python tools/prepare_ep2_weights.py projects/configs/ep2/q4.py
+bash scripts/train_ep1.sh projects/configs/ep2/q4.py
+```
+
+初始化文件已存在时不要重复生成。日志和权重位于 `work_dirs/ep2/q4/`。Q4需独立比较mAP/NDS/mIoU，不能因参数量下降就推断精度或板端速度。
+
+本次Q4通过真实样本前向/反向/一次更新和量化状态严格保存加载检查，565个梯度张量有限，320个标尺缓冲一致。四卡正式训练已到50/5274步，loss_occ约0.1946、总loss约8.8246、grad_norm约14.1393，显存日志峰值27532MiB；仅表示初期训练正常。

@@ -9,7 +9,7 @@ import torch
 import onnxruntime as ort
 from mmcv import Config
 from mmdet.datasets import build_dataset
-from tools.ep1_common import sample_to_device
+from tools.ep1_common import sample_to_device, occ_forward_projection
 from projects.mmdet3d_plugin.models.detection3d.decoder import SparseBox3DDecoder
 from projects.mmdet3d_plugin.models.ep1.deployment import history_is_valid
 
@@ -54,6 +54,7 @@ class Runner:
         self.timing = dict(preprocess=0.,inference=0.,decode=0.)
         self.inputs = self.session.get_inputs()
         self.decoder = SparseBox3DDecoder(**{k:v for k,v in self.cfg.model.head.det_head.decoder.items() if k != 'type'})
+        self.dynamic_rig = {"projection_mat","occ_ego2img"}.issubset(x.name for x in self.inputs)
         self.previous = None; self.cache = None
         calibration = Path(args.onnx).with_suffix('.calibration.npz')
         if not calibration.exists():
@@ -61,16 +62,21 @@ class Runner:
         with np.load(calibration) as f:
             self.rig = {k:f[k] for k in ['projection_mat','image_wh','occ_img2ego']}
         self.rig_errors = []
-        print("Evaluating fixed-rig ONNX; sample-varying nuScenes calibration may affect metrics.", flush=True)
+        print("Runtime geometry ONNX" if self.dynamic_rig else "Fixed-rig ONNX: dataset calibration mismatch may affect metrics", flush=True)
 
     def infer(self, index):
         started=time.perf_counter()
         data = sample_to_device(self.dataset, index, -1)
+        if not np.array_equal(data['image_wh'].numpy(),self.rig['image_wh']):
+            raise ValueError('Dataset image_wh differs from the fixed ONNX dimensions')
         meta = data['img_metas'][0]
         scene, timestamp = meta['scene_token'], float(meta['timestamp'])
         valid = self.previous is not None and history_is_valid(timestamp-self.previous[1], self.previous[0], scene)
         feed = {x.name:np.zeros(x.shape, np.float32) for x in self.inputs}
         feed['img'] = data['img'].numpy().astype(np.float32)
+        if self.dynamic_rig:
+            feed["projection_mat"]=data["projection_mat"].numpy().astype(np.float32)
+            feed["occ_ego2img"]=occ_forward_projection(data["occ_img2ego"]).numpy().astype(np.float32)
         feed['history_transform'] = np.eye(4,dtype=np.float32)[None]
         feed['time_interval'] = np.array([.5],np.float32)
         feed['history_valid'] = np.array([float(valid)],np.float32)
@@ -96,7 +102,7 @@ class Runner:
         return pred
 
     def provenance(self):
-        return dict(scope='Fixed-rig ONNX on nuScenes; calibration mismatch can affect metrics. Not PTH equivalence.',
+        return dict(scope='Runtime projection/occ geometry' if self.dynamic_rig else 'Fixed-rig ONNX; dataset calibration mismatch can affect metrics',
             timing_seconds=self.timing, provider=self.session.get_providers(),frames=len(self.rig_errors),
             calibration_max_abs={k:max(x[k] for x in self.rig_errors) for k in self.rig} if self.rig_errors else {})
 
