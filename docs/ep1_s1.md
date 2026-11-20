@@ -42,7 +42,7 @@ G5深度配置为 `[1,60,1]`（59个depth+64个context），当前为 `[1,45,1]`
 生成脚本：
 
 ```bash
-PYTHONPATH=. python tools/prepare_ep1_weights.py \
+PYTHONPATH=. python tools/prepare/prepare_ep1_weights.py \
   --g5 /path/to/BEVDet/ckpt/g5.pth \
   --stage1 ckpt/sparsedrive_stage1.pth
 ```
@@ -53,7 +53,7 @@ PYTHONPATH=. python tools/prepare_ep1_weights.py \
 
 导入的骨干和BEV编码器保留G5折叠BN的running statistics（各自norm_eval=True），卷积和BN affine仍训练。这个策略不会冻结检测LayerNorm，也不会冻结OCC预测MLP。G5的BEV物理范围/分辨率与当前不同，迁移后仍需微调，不能视为源模型的精度复现。
 
-原 `tools/prepare_ep1_backbone.py` 保留作单独骨干检查工具，不是默认训练初始化入口。正式推理/导出应加载训练后的完整S1 checkpoint；不使用原SparseDrive stage1作为完整模型恢复文件。
+原 `tools/prepare/prepare_ep1_backbone.py` 保留作单独骨干检查工具，不是默认训练初始化入口。正式推理/导出应加载训练后的完整S1 checkpoint；不使用原SparseDrive stage1作为完整模型恢复文件。
 
 ## 数据与坐标
 
@@ -75,7 +75,7 @@ cd /path/to/SparseDrive
 python -m pip install -r requirement.txt
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 (cd projects/mmdet3d_plugin/ops && python setup.py build_ext --inplace)
-python tools/prepare_ep1_anchors.py
+python tools/prepare/prepare_ep1_anchors.py
 bash scripts/train_ep1_s1.sh
 ```
 

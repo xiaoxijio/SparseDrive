@@ -2,7 +2,7 @@
 import unittest
 import torch
 from torch import nn
-from tools.prepare_ep1_weights import depth_channel_indices, merge_states
+from tools.prepare.prepare_ep1_weights import depth_channel_indices, merge_states
 from projects.mmdet3d_plugin.models.ep1.flashocc import FlashOccBranch
 
 

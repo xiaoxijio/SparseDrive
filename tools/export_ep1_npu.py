@@ -1,4 +1,4 @@
-"""Export S6 with runtime camera calibration and history; image_wh is fixed."""
+"""Export S6 with fixed or runtime camera matrices and runtime history."""
 import argparse
 import warnings
 import sys
@@ -35,15 +35,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default='projects/configs/ep1/s6_det_occ_decoder4_fpn3_fastbev.py')
     parser.add_argument('--checkpoint', default='ckpt/iter_3512.pth')
+    parser.add_argument('--calibration-mode', choices=('dynamic', 'fixed'), default='dynamic')
     parser.add_argument('--calibration', help='npz with projection_mat, image_wh, occ_img2ego')
     parser.add_argument('--sample-index', type=int, default=0)
-    parser.add_argument('--output', default='onnx/s6/s6.onnx')
+    parser.add_argument('--output', help='Defaults to onnx/s6/s6.onnx (dynamic) or onnx/s6/s6_fixed.onnx')
     parser.add_argument('--verbose-warnings', action='store_true', help='Print each export warning as well as recording it')
     parser.add_argument('--check-only', action='store_true', help='Validate an existing ONNX without exporting again')
     parser.add_argument('--no-simplify', dest='simplify', action='store_false',
                         help='Disable default onnxsim simplification for debugging')
     args = parser.parse_args()
-    if args.simplify:
+    if args.simplify and not args.check_only:
         try:
             from onnxsim import simplify
         except ImportError:
@@ -54,7 +55,7 @@ def main():
     dataset = build_dataset(cfg.data.val)
     data = sample_to_device(dataset, args.sample_index, device=-1)
     original = list(make_export_inputs(model, data))
-    output = Path(args.output); output.parent.mkdir(parents=True, exist_ok=True)
+    output = Path(args.output or ('onnx/s6/s6_fixed.onnx' if args.calibration_mode == 'fixed' else 'onnx/s6/s6.onnx')); output.parent.mkdir(parents=True, exist_ok=True)
     if args.check_only and not args.calibration:
         args.calibration = str(output.with_suffix('.calibration.npz'))
     if args.calibration:
@@ -71,12 +72,13 @@ def main():
     np.savez(output.with_suffix('.calibration.npz'),
              projection_mat=original[1].numpy(), image_wh=original[2].numpy(),
              occ_img2ego=original[3].numpy(), provenance=np.array(calibration_source))
-    input_names = DYNAMIC_INPUT_NAMES
+    fixed_rig = args.calibration_mode == 'fixed'
+    input_names = DYNAMIC_INPUT_NAMES[:1] + DYNAMIC_INPUT_NAMES[3:] if fixed_rig else DYNAMIC_INPUT_NAMES
     wrapper = DynamicRigDeployment(model, original[2]).eval()
     inputs = [original[0], original[1], occ_forward_projection(original[3])] + original[4:]
     inputs[-1] = inputs[-1].float()
     report = dict(calibration=calibration_source, checkpoint=args.checkpoint,
-                  initialization=cfg.get('load_from'), inputs=input_names, outputs=OUTPUT_NAMES, calibration_mode='dynamic',
+                  initialization=cfg.get('load_from'), inputs=input_names, outputs=OUTPUT_NAMES, calibration_mode=args.calibration_mode,
                   host_validity_required=True, time_interval_dynamic=True,
                   npu_compilation_tested=False)
     if not args.check_only:
@@ -84,7 +86,7 @@ def main():
             warnings.simplefilter('always')
             with torch.no_grad():
                 torch.onnx.export(wrapper, tuple(inputs), str(output), opset_version=16,
-                                  input_names=input_names, output_names=OUTPUT_NAMES,
+                                  input_names=DYNAMIC_INPUT_NAMES, output_names=OUTPUT_NAMES,
                                   do_constant_folding=True)
         warning_rows = [dict(category=w.category.__name__, message=str(w.message),
                              filename=w.filename, lineno=w.lineno) for w in captured]
@@ -103,7 +105,7 @@ def main():
             for a in node.attribute:
                 if a.name == 'coordinate_transformation_mode' and a.s == b'half_pixel':
                     a.s = b'pytorch_half_pixel'
-    if args.simplify:
+    if args.simplify and not args.check_only:
         graph, checked = simplify(graph)
         assert checked
     # Avoid the SDK's false QAT match on real pixel-coordinate clipping.
@@ -118,6 +120,13 @@ def main():
             rewritten.append(onnx.helper.make_node('Max' if i==0 else 'Min', [current,x], [out], name=node.name+'_bound_op_'+str(i)))
             current = out
     del graph.graph.node[:]; graph.graph.node.extend(rewritten)
+    if fixed_rig:
+        matrices = dict(zip(DYNAMIC_INPUT_NAMES[1:3], inputs[1:3]))
+        for value in list(graph.graph.input):
+            if value.name in matrices:
+                graph.graph.initializer.append(
+                    onnx.numpy_helper.from_array(matrices[value.name].numpy(), value.name))
+                graph.graph.input.remove(value)
     onnx.checker.check_model(graph)
     onnx.save(graph, str(output))
     options = ort.SessionOptions(); options.intra_op_num_threads = 4
@@ -138,7 +147,7 @@ def main():
             ref[3] = ref[3].argmax(-1).to(torch.int32)
             ref = [x.numpy() for x in ref]
             fixed = [x.numpy() for x in wrapper(*values)]
-        observed = session.run(None, dict(zip(input_names, [x.numpy() for x in values])))
+        observed = session.run(None, {key: x.numpy() for key, x in zip(DYNAMIC_INPUT_NAMES, values) if key in input_names})
         actual, ort_logits = observed[:7], observed[7]
         logit_error = np.max(np.abs(ref_logits-ort_logits),axis=-1)
         sorted_logits = np.sort(ref_logits,axis=-1)
@@ -182,7 +191,11 @@ def main():
     next_original = list(make_export_inputs(model,next_data))
     changed = list(inputs)
     changed[0],changed[1],changed[2] = next_original[0],next_original[1],occ_forward_projection(next_original[3])
-    check('different_sample_calibration',changed,next_original[3])
+    if fixed_rig:
+        changed[1:3] = inputs[1:3]
+        check('different_image_fixed_calibration', changed)
+    else:
+        check('different_sample_calibration',changed,next_original[3])
     report['output_shapes'] = [list(x.shape) for x in first]
     report['occ_output_bytes'] = int(first[3].nbytes)
     report['validation_passed'] = not report.get('validation_failures')

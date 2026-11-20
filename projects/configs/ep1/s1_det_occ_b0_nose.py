@@ -1,7 +1,7 @@
 """EP1 stage 1: shared B0-noSE, sparse detection (150+300), and FlashOCC.
 
 No map, tracking IDs, motion or planning. Configuration is self-contained.
-Run tools/prepare_ep1_anchors.py before first use. See docs/ep1_s1.md.
+Run tools/prepare/prepare_ep1_anchors.py before first use. See docs/ep1_s1.md.
 """
 plugin = True
 plugin_dir = 'projects/mmdet3d_plugin/'

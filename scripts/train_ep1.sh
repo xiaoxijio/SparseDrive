@@ -18,7 +18,7 @@ if [[ ! -f "$CONFIG" ]]; then
   echo "Config not found: $CONFIG" >&2
   exit 2
 fi
-python tools/prepare_ep1_anchors.py
+python tools/prepare/prepare_ep1_anchors.py
 python -m torch.distributed.run \
   --nproc_per_node=4 --master_port="${PORT:-29501}" \
   tools/train.py "$CONFIG" --launcher pytorch --no-validate "$@"

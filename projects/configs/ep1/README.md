@@ -173,3 +173,5 @@ bash 03_omg.sh
 四帧校准只验证编译流程，不能替代代表性量化校准集、全量mAP/NDS/mIoU评估或实体板测速。
 
 本次 `iter_3512.pth` 已实际生成 `/home/fjm/tong/Compilation/app/sparse/models/s6.ortm`，1437个算子全部NPU，无自定义CPU插件。SDK单核模拟约343.19ms/2.91383 FPS，非实体板实测。首帧SDK fake-quant输出均有限，但体素类别一致率约91.23%、检测仍有明显量化差异，INT8精度未验收；不能将该比例作为mIoU。
+
+固定和动态两种标定的导出、校准和编译步骤见 [S6 ONNX 编译流程](../../../docs/s6_onnx_compile.md)。

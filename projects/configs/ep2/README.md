@@ -45,8 +45,8 @@ bash scripts/train_ep1.sh projects/configs/ep2/q2.py
 
 不需要重新生成初始化，已经准备好。若需要自行重建（输出文件必须不存在）：
 ```bash
-PYTHONPATH=. python tools/prepare_ep2_weights.py projects/configs/ep2/q1.py
-PYTHONPATH=. python tools/prepare_ep2_weights.py projects/configs/ep2/q2.py
+PYTHONPATH=. python tools/prepare/prepare_ep2_weights.py projects/configs/ep2/q1.py
+PYTHONPATH=. python tools/prepare/prepare_ep2_weights.py projects/configs/ep2/q2.py
 ```
 真实样本QAT检查（并非完整训练）：
 ```bash
@@ -102,14 +102,14 @@ bash scripts/train_ep1.sh projects/configs/ep2/q3.py
 
 `q4.py`继承Q3，只将4个检测FFN的hidden从1024改为512。其余结构、FastBEV单平面采样、大OCC编码器、3层FPN、query/历史数量和QAT范围不变。FFN的Linear仍为浮点，这里是S3的结构缩减，不是新增Linear INT8量化。
 
-初始化由 `tools/prepare_ep2_weights.py projects/configs/ep2/q4.py` 生成 `ckpt/q4_qat_init.pth`：保留最终Q3 `work_dirs/ep2/q3/iter_5274.pth` 的卷积QAT权重、320个scale/zero_point缓冲和其他匹配状态；四个FFN完整使用已训练S3 `work_dirs/ep1/s3_det_occ_decoder4_ffn512/iter_8780.pth` 对应参数，不随意截取Q3权重。结构变化需要联合适应训练，不能当作等价推理替换。
+初始化由 `tools/prepare/prepare_ep2_weights.py projects/configs/ep2/q4.py` 生成 `ckpt/q4_qat_init.pth`：保留最终Q3 `work_dirs/ep2/q3/iter_5274.pth` 的卷积QAT权重、320个scale/zero_point缓冲和其他匹配状态；四个FFN完整使用已训练S3 `work_dirs/ep1/s3_det_occ_decoder4_ffn512/iter_8780.pth` 对应参数，不随意截取Q3权重。结构变化需要联合适应训练，不能当作等价推理替换。
 
 `qat_init_from`表示量化模型权重暖启动，区别于普通FP load_from和断点resume_from：先按recipe重建量化模块，再严格加载全部初始化状态；不恢复旧优化器、epoch或iter。训练仍为四卡每卡batch8、6轮5274步，LR1e-5，warmup250；BN立即冻结，observer重新观察一轮后冻结。checkpoint每879步保存，保留最近3份。
 
 ```bash
 cd /root/SparseDrive
 conda activate sparsedrive
-PYTHONPATH=. python tools/prepare_ep2_weights.py projects/configs/ep2/q4.py
+PYTHONPATH=. python tools/prepare/prepare_ep2_weights.py projects/configs/ep2/q4.py
 bash scripts/train_ep1.sh projects/configs/ep2/q4.py
 ```
 

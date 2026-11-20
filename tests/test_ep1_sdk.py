@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from projects.mmdet3d_plugin.models.ep1.backbone import EfficientNetB0NoSE
 from projects.mmdet3d_plugin.models.ep1.flashocc import LSSViewTransform
-from tools.prepare_ep1_backbone import extract_backbone
+from tools.prepare.prepare_ep1_backbone import extract_backbone
 
 
 class SDKChecks(unittest.TestCase):
